@@ -1,8 +1,9 @@
 """
 ================================================================================
- Neura Stream — Hybrid Video Platform (single file, zero API keys)
- YouTube-style home + Instagram-style reels + own video uploads + multi-platform
- extraction (YouTube / Instagram / Facebook / X / Telegram / WhatsApp links).
+ Neura Stream — Prime-style streaming platform (single file, zero API keys)
+ Cinematic browse UI: hero banner, Prime-style shelves, YouTube content via
+ keyless ytsearch, reels (YouTube Shorts + Instagram/Facebook/X links),
+ own uploads, multi-platform extraction and an AI co-pilot.
  Built to run on Render's free tier (512 MB RAM).
 ================================================================================
 
@@ -29,9 +30,12 @@
 
 import asyncio
 import base64
+import hashlib
 import mimetypes
 import os
 import re
+import secrets
+import smtplib
 import sqlite3
 import time
 import uuid
@@ -47,7 +51,7 @@ try:  # package was renamed: works with both `duckduckgo-search` and `ddgs`
 except ImportError:  # pragma: no cover
     from ddgs import DDGS
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +62,7 @@ app = FastAPI(
     title="Neura Stream",
     description="Hybrid video platform: uploads, reels, multi-platform extraction, "
     "live web search and an AI co-pilot — zero API keys.",
-    version="3.0.0",
+    version="4.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -161,6 +165,23 @@ def init_db() -> None:
                 body       TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                email      TEXT UNIQUE NOT NULL,
+                name       TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS otp_codes (
+                email      TEXT PRIMARY KEY,
+                code_hash  TEXT NOT NULL,
+                attempts   INTEGER DEFAULT 0,
+                expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                expires_at REAL NOT NULL
+            );
             """
         )
 
@@ -238,14 +259,15 @@ class CommentIn(BaseModel):
 
 
 @app.post("/api/videos/{vid}/comments")
-def api_add_comment(vid: str, payload: CommentIn):
+def api_add_comment(vid: str, payload: CommentIn, request: Request):
     with _db() as conn:
         exists = conn.execute("SELECT 1 FROM videos WHERE id = ?", (vid,)).fetchone()
         if not exists:
             return {"error": "not_found", "message": "Video not found."}
         conn.execute(
             "INSERT INTO comments (video_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-            (vid, payload.author.strip() or "Guest", payload.body.strip(), time.time()),
+            (vid, (_current_user(request) or {}).get("name") or payload.author.strip() or "Guest",
+             payload.body.strip(), time.time()),
         )
     return {"ok": True}
 
@@ -274,12 +296,14 @@ async def api_upload(
     file: UploadFile = File(...),
     title: str = Form(...),
     description: str = Form(""),
-    uploader: str = Form("Guest Creator"),
+    uploader: str = Form(""),
+    request: Request = None,
     duration: float = Form(0.0),
     thumbnail: str = Form(""),
 ):
     title = title.strip()[:150] or file.filename or "Untitled upload"
-    uploader = uploader.strip()[:60] or "Guest Creator"
+    session_user = _current_user(request) if request else None
+    uploader = (uploader.strip()[:60]) or (session_user or {}).get("name") or "Guest Creator"
     description = description.strip()[:2000]
 
     if file.content_type and not file.content_type.startswith("video/"):
@@ -530,6 +554,61 @@ async def api_stream(url: str = Query(..., min_length=8)):
 
 
 # --------------------------------------------------------------------------- #
+#  Zero-API YouTube browse engine (yt-dlp ytsearch, extract_flat = fast)       #
+# --------------------------------------------------------------------------- #
+
+BROWSE_OPTS: Dict[str, Any] = {
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    "extract_flat": "in_playlist",  # metadata only — no per-video format fetch
+    "socket_timeout": 15,
+    "retries": 2,
+    "nocheckcertificate": True,
+    "cachedir": False,
+    "http_headers": {"User-Agent": USER_AGENT},
+}
+
+
+def _browse_sync(query: str, count: int) -> List[Dict[str, Any]]:
+    """Search YouTube via ytsearch{N}: — zero API keys, flat and fast."""
+    with yt_dlp.YoutubeDL(dict(BROWSE_OPTS)) as ydl:
+        info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+    out: List[Dict[str, Any]] = []
+    for e in (info.get("entries") or []):
+        if not e or not e.get("id"):
+            continue
+        thumbs = e.get("thumbnails") or []
+        thumb = e.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+        out.append({
+            "title": e.get("title") or "Untitled",
+            "url": f"https://www.youtube.com/watch?v={e['id']}",
+            "thumbnail": thumb,
+            "duration": e.get("duration") or 0,
+            "duration_label": _fmt_duration(e.get("duration")),
+            "view_count": e.get("view_count"),
+            "uploader": e.get("channel") or e.get("uploader") or "YouTube",
+            "kind": "youtube",
+        })
+    return out
+
+
+@app.get("/api/browse")
+async def api_browse(q: str = Query(..., min_length=2), n: int = Query(24, ge=1, le=40)):
+    """Prime-style browse rows: YouTube search results, no API keys."""
+    try:
+        items = await asyncio.to_thread(_browse_sync, q, n)
+        return {"query": q, "items": items, "error": None}
+    except yt_dlp.utils.DownloadError as exc:
+        msg = str(exc).replace("ERROR:", "").strip()[:300]
+        if "Sign in to confirm" in msg or "not a bot" in msg:
+            msg = "YouTube is bot-checking this server's IP right now — shelves will fill in when it clears. Try a direct link meanwhile."
+        return {"query": q, "items": [], "error": msg}
+    except Exception as exc:
+        return {"query": q, "items": [], "error": f"Browse failed: {str(exc)[:200]}"}
+
+
+# --------------------------------------------------------------------------- #
 #  Zero-API live web search (duckduckgo_search)                                #
 # --------------------------------------------------------------------------- #
 
@@ -754,13 +833,157 @@ async def api_proxy(url: str, request: Request):
 #  Frontend — hybrid platform UI (embedded HTML/CSS/JS)                         #
 # --------------------------------------------------------------------------- #
 
+
+# --------------------------------------------------------------------------- #
+#  Email OTP auth (free SMTP via env vars; dev-mode fallback shows the code)   #
+# --------------------------------------------------------------------------- #
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", "Neura Studio <no-reply@neurastudio.official.com>")
+
+SESSION_COOKIE = "neura_session"
+SESSION_DAYS = 30
+OTP_TTL_SECONDS = 600
+OTP_MAX_ATTEMPTS = 5
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _send_otp_email(to_email: str, code: str) -> bool:
+    """Send the OTP over SMTP. Works with any free provider (Gmail app password,
+    Brevo, Resend SMTP etc.). Returns False when not configured."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+        return False
+    body = (
+        "Your Neura Stream verification code is:\n\n"
+        f"    {code}\n\n"
+        "It expires in 10 minutes. If you did not request it, ignore this mail.\n\n"
+        "— Neura Studio (neurastudio.official.com)"
+    )
+    msg = (
+        f"From: {MAIL_FROM}\r\n"
+        f"To: {to_email}\r\n"
+        "Subject: Your Neura Stream login code\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        f"{body}"
+    )
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, [to_email], msg)
+        return True
+    except Exception:
+        return False
+
+
+def _current_user(request: Request) -> Optional[Dict[str, Any]]:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT u.id, u.email, u.name FROM sessions s JOIN users u ON u.id = s.user_id "
+            "WHERE s.token_hash = ? AND s.expires_at > ?",
+            (_sha256(token), time.time()),
+        ).fetchone()
+    return {"id": row["id"], "email": row["email"], "name": row["name"]} if row else None
+
+
+class OtpRequest(BaseModel):
+    email: str = Field(..., max_length=120)
+
+
+class OtpVerify(BaseModel):
+    email: str = Field(..., max_length=120)
+    code: str = Field(..., min_length=4, max_length=8)
+    name: str = Field("", max_length=40)
+
+
+@app.post("/api/auth/request-otp")
+def api_request_otp(payload: OtpRequest):
+    email = payload.email.strip().lower()
+    if not EMAIL_RE.fullmatch(email):
+        return {"error": "bad_email", "message": "Please enter a valid email address."}
+    code = f"{secrets.randbelow(1000000):06d}"
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO otp_codes (email, code_hash, attempts, expires_at) VALUES (?, ?, 0, ?) "
+            "ON CONFLICT(email) DO UPDATE SET code_hash = excluded.code_hash, attempts = 0, expires_at = excluded.expires_at",
+            (email, _sha256(code), time.time() + OTP_TTL_SECONDS),
+        )
+    sent = _send_otp_email(email, code)
+    resp = {"ok": True, "email": email, "email_sent": sent}
+    if not sent:
+        # dev-mode fallback: no SMTP configured — surface the code so the flow works
+        resp["dev_otp"] = code
+        resp["message"] = ("SMTP is not configured on this server (set SMTP_HOST/SMTP_USER/SMTP_PASS), "
+                           "so here is your code directly.")
+    return resp
+
+
+@app.post("/api/auth/verify")
+def api_verify_otp(payload: OtpVerify, request: Request):
+    email = payload.email.strip().lower()
+    code = payload.code.strip()
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM otp_codes WHERE email = ?", (email,)).fetchone()
+        if not row:
+            return {"error": "no_code", "message": "Request a code first."}
+        if row["expires_at"] < time.time():
+            conn.execute("DELETE FROM otp_codes WHERE email = ?", (email,))
+            return {"error": "expired", "message": "That code expired — request a new one."}
+        if row["attempts"] >= OTP_MAX_ATTEMPTS:
+            return {"error": "too_many", "message": "Too many wrong tries — request a new code."}
+        if row["code_hash"] != _sha256(code):
+            conn.execute("UPDATE otp_codes SET attempts = attempts + 1 WHERE email = ?", (email,))
+            return {"error": "wrong_code", "message": "That code is incorrect."}
+        conn.execute("DELETE FROM otp_codes WHERE email = ?", (email,))
+        user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if not user:
+            name = payload.name.strip() or email.split("@")[0]
+            conn.execute("INSERT INTO users (email, name, created_at) VALUES (?, ?, ?)", (email, name, time.time()))
+            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            (_sha256(token), user["id"], time.time() + SESSION_DAYS * 86400),
+        )
+    response = JSONResponse({"ok": True, "user": {"email": email, "name": user["name"]}})
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_DAYS * 86400, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    return {"user": _current_user(request)}
+
+
+@app.post("/api/auth/logout")
+def api_logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        with _db() as conn:
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_sha256(token),))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
 FRONTEND = r"""
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Neura Stream — watch, upload & share</title>
+<title>Neura Prime — stream everything</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
 tailwind.config = { darkMode:'class', theme:{ extend:{
@@ -779,48 +1002,57 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:rgba(217,70,239,.25);border-radius:8px}
   ::-webkit-scrollbar-thumb:hover{background:rgba(217,70,239,.45)}
-  body{background:#07070d}
+  body{background:#050510}
   .glass{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(18px)}
   .glow-blob{position:fixed;border-radius:9999px;filter:blur(110px);z-index:-1;pointer-events:none}
   input[type=range].forge-seek{-webkit-appearance:none;appearance:none;height:5px;border-radius:99px;
-    background:linear-gradient(90deg,#d946ef var(--fill,0%),rgba(255,255,255,.14) var(--fill,0%));cursor:pointer}
+    background:linear-gradient(90deg,#0ea5e9 var(--fill,0%),rgba(255,255,255,.14) var(--fill,0%));cursor:pointer}
   input[type=range].forge-seek::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:99px;
-    background:#fff;box-shadow:0 0 12px rgba(217,70,239,.9);transition:transform .15s}
+    background:#fff;box-shadow:0 0 12px rgba(14,165,233,.9);transition:transform .15s}
   input[type=range].forge-seek::-webkit-slider-thumb:hover{transform:scale(1.25)}
-  input[type=range].forge-seek::-moz-range-thumb{width:14px;height:14px;border:none;border-radius:99px;background:#fff;box-shadow:0 0 12px rgba(217,70,239,.9)}
+  input[type=range].forge-seek::-moz-range-thumb{width:14px;height:14px;border:none;border-radius:99px;background:#fff;box-shadow:0 0 12px rgba(14,165,233,.9)}
   .msg-in{animation:fadeUp .3s ease-out both}
   .chip{transition:all .18s}
-  .chip:hover{transform:translateY(-1px);background:rgba(217,70,239,.15);border-color:rgba(217,70,239,.4)}
-  .card-hover{transition:all .2s ease}
-  .card-hover:hover{transform:translateY(-3px);border-color:rgba(217,70,239,.35);box-shadow:0 12px 40px -12px rgba(217,70,239,.25)}
+  .chip:hover{transform:translateY(-1px);background:rgba(14,165,233,.15);border-color:rgba(14,165,233,.4)}
   .no-scrollbar::-webkit-scrollbar{display:none}
   .view{display:none}
   .view.active{display:block}
   .reel-track{scroll-snap-type:y mandatory;-ms-overflow-style:none;scrollbar-width:none}
   .reel-track::-webkit-scrollbar{display:none}
   .reel-item{scroll-snap-align:start;scroll-snap-stop:always}
-  .tab-btn.active{background:rgba(217,70,239,.15);color:#e879f9;border-color:rgba(217,70,239,.4)}
-  .drop-zone.drag{border-color:#d946ef;background:rgba(217,70,239,.1)}
+  .tab-btn.active{background:rgba(14,165,233,.18);color:#7dd3fc;border-color:rgba(14,165,233,.5)}
+  .drop-zone.drag{border-color:#0ea5e9;background:rgba(14,165,233,.1)}
+  .line-clamp-1{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
   .line-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .line-clamp-3{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  /* Prime-style hero */
+  #hero{background-size:cover;background-position:center 20%}
+  .hero-fade-b{background:linear-gradient(to top,#050510 5%,rgba(5,5,16,.65) 40%,transparent 90%)}
+  .hero-fade-l{background:linear-gradient(to right,rgba(5,5,16,.92) 0%,rgba(5,5,16,.55) 38%,transparent 75%)}
+  /* shelf */
+  .shelf{scroll-behavior:smooth}
+  .shelf::-webkit-scrollbar{display:none}
+  .poster{transition:transform .25s ease, box-shadow .25s ease}
+  .poster:hover{transform:scale(1.07);box-shadow:0 18px 50px -12px rgba(14,165,233,.45);z-index:10}
+  .poster .ph-over{opacity:0;transition:opacity .2s}
+  .poster:hover .ph-over{opacity:1}
+  .nav-solid{background:rgba(5,5,16,.92)!important;backdrop-filter:blur(14px);border-color:rgba(255,255,255,.08)!important}
 </style>
 </head>
 <body class="text-gray-100 font-sans min-h-screen antialiased">
 
-<div class="glow-blob w-[38rem] h-[38rem] bg-fuchsia-600/20 -top-40 -left-40 animate-pulseGlow"></div>
-<div class="glow-blob w-[30rem] h-[30rem] bg-cyan-500/15 top-1/3 -right-40 animate-pulseGlow" style="animation-delay:.8s"></div>
-<div class="glow-blob w-[26rem] h-[26rem] bg-violet-700/20 bottom-0 left-1/3"></div>
+<div class="glow-blob w-[38rem] h-[38rem] bg-sky-600/15 -top-40 -left-40 animate-pulseGlow"></div>
+<div class="glow-blob w-[30rem] h-[30rem] bg-fuchsia-600/15 top-1/3 -right-40 animate-pulseGlow" style="animation-delay:.8s"></div>
 
-<!-- ================= HEADER ================= -->
-<header class="sticky top-0 z-40 glass border-b border-white/10">
-  <div class="max-w-[1600px] mx-auto px-3 sm:px-6 h-16 flex items-center gap-3">
+<!-- ================= HEADER (transparent -> solid) ================= -->
+<header id="top-nav" class="sticky top-0 z-40 transition-all duration-300" style="background:transparent;border-bottom:1px solid transparent">
+  <div class="max-w-[1700px] mx-auto px-3 sm:px-6 h-16 flex items-center gap-3">
     <button id="nav-home" class="flex items-center gap-2.5 shrink-0">
-      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-fuchsia-500 to-cyan-400 grid place-items-center shadow-lg shadow-fuchsia-500/30">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center shadow-lg shadow-sky-500/30">
         <svg style="width:18px;height:18px" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/><rect x="2" y="4" width="3.5" height="16" rx="1.5"/></svg>
       </div>
       <div class="leading-tight hidden sm:block">
-        <h1 class="font-extrabold text-lg tracking-tight bg-gradient-to-r from-fuchsia-400 via-white to-cyan-300 bg-clip-text text-transparent">Neura Stream</h1>
-        <p class="text-[10px] text-gray-500">watch · upload · share</p>
+        <h1 class="font-extrabold text-lg tracking-tight bg-gradient-to-r from-sky-300 via-white to-fuchsia-400 bg-clip-text text-transparent">neura<span class="text-white">prime</span></h1>
       </div>
     </button>
 
@@ -832,31 +1064,39 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
     <form id="main-form" class="flex-1 max-w-xl mx-auto hidden md:flex">
       <div class="relative w-full">
         <svg class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-4.35-4.35M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z"/></svg>
-        <input id="main-input" autocomplete="off" placeholder="Paste any video link or search…"
-          class="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 focus:ring-2 focus:ring-fuchsia-500/20 outline-none text-sm placeholder-gray-600 transition">
+        <input id="main-input" autocomplete="off" placeholder="Search or paste any video link…"
+          class="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/20 outline-none text-sm placeholder-gray-600 transition">
       </div>
     </form>
 
     <div class="flex items-center gap-2 ml-auto">
-      <button id="btn-upload" class="flex items-center gap-2 px-3.5 py-2 rounded-xl font-semibold text-xs sm:text-sm bg-gradient-to-r from-fuchsia-500 to-fuchsia-600 hover:from-fuchsia-400 hover:to-fuchsia-500 shadow-lg shadow-fuchsia-500/30 transition-all active:scale-95">
+      <button id="theme-toggle" class="chip px-2.5 py-2.5 rounded-xl glass" title="Dark / light mode">
+        <svg id="ic-sun" class="w-4 h-4 text-amber-300 hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path stroke-linecap="round" d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg id="ic-moon" class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      </button>
+      <button id="auth-zone-btn" class="chip flex items-center gap-2 px-3 py-2 rounded-xl glass text-xs font-semibold">
+        <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM12 14a7 7 0 0 0-7 7h14a7 7 0 0 0-7-7Z"/></svg>
+        <span id="auth-zone-label">Sign in</span>
+      </button>
+      <button id="btn-upload" class="flex items-center gap-2 px-3.5 py-2 rounded-xl font-semibold text-xs sm:text-sm bg-gradient-to-r from-sky-400 to-sky-500 hover:from-sky-300 hover:to-sky-400 text-slate-900 shadow-lg shadow-sky-500/30 transition-all active:scale-95">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
         <span class="hidden sm:inline">Upload</span>
       </button>
       <button id="chat-toggle" class="chip px-2.5 py-2.5 rounded-xl glass" title="AI Co-pilot">
-        <svg class="w-4 h-4 text-fuchsia-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h8M8 14h5M21 12a9 9 0 1 1-4.4-7.7L21 3l-1 4.4A8.96 8.96 0 0 1 21 12Z"/></svg>
+        <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h8M8 14h5M21 12a9 9 0 1 1-4.4-7.7L21 3l-1 4.4A8.96 8.96 0 0 1 21 12Z"/></svg>
       </button>
     </div>
   </div>
   <form id="main-form-m" class="md:hidden px-3 pb-3">
-    <input id="main-input-m" autocomplete="off" placeholder="Paste any video link or search…"
-      class="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600">
+    <input id="main-input-m" autocomplete="off" placeholder="Search or paste any video link…"
+      class="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
   </form>
 </header>
 
 <!-- ================= STATUS / ERROR ================= -->
-<div class="max-w-[1600px] mx-auto px-4 sm:px-6 pt-4 space-y-3">
+<div class="max-w-[1700px] mx-auto px-4 sm:px-6 pt-4 space-y-3">
   <div id="status-bar" class="hidden glass rounded-2xl px-5 py-3.5 text-sm flex items-center gap-3">
-    <svg class="w-5 h-5 text-fuchsia-400 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4Z"/></svg>
+    <svg class="w-5 h-5 text-sky-400 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4Z"/></svg>
     <span id="status-text" class="text-gray-300">Working…</span>
   </div>
   <div id="error-bar" class="hidden glass rounded-2xl px-5 py-4 text-sm border-red-500/30 bg-red-500/10 flex items-start gap-3">
@@ -865,53 +1105,47 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
   </div>
 </div>
 
-<!-- ================= VIEW: HOME ================= -->
-<main id="view-home" class="view active max-w-[1600px] mx-auto px-4 sm:px-6 py-6 space-y-8">
+<!-- ================= VIEW: HOME (Prime-style) ================= -->
+<main id="view-home" class="view active">
 
-  <section class="glass rounded-3xl p-6 sm:p-8 relative overflow-hidden">
-    <div class="absolute inset-0 bg-gradient-to-br from-fuchsia-600/10 via-transparent to-cyan-500/10 pointer-events-none"></div>
-    <div class="relative flex flex-col lg:flex-row lg:items-center gap-6">
-      <div class="flex-1">
-        <h2 class="text-2xl sm:text-3xl font-extrabold tracking-tight mb-2">
-          One platform. <span class="bg-gradient-to-r from-fuchsia-400 to-cyan-300 bg-clip-text text-transparent">Every video.</span>
-        </h2>
-        <p class="text-sm text-gray-400 mb-4">Watch from YouTube, Instagram, X, Facebook & Telegram · upload your own · browse reels · ask the AI co-pilot. Zero API keys.</p>
-        <div class="flex flex-wrap gap-2">
-          <button class="chip demo px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400" data-q="https://www.youtube.com/watch?v=aqz-KE-bpKQ">Try a YouTube link</button>
-          <button class="chip demo px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400" data-q="trending bollywood songs">Trending music</button>
-          <button class="chip demo px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400" data-q="isro latest mission">ISRO updates</button>
-        </div>
+  <!-- HERO -->
+  <section id="hero" class="relative w-full h-[62vh] min-h-[420px] flex items-end overflow-hidden">
+    <div class="hero-fade-l absolute inset-0"></div>
+    <div class="hero-fade-b absolute inset-0"></div>
+    <div id="hero-content" class="relative z-10 max-w-[1700px] mx-auto w-full px-4 sm:px-8 pb-10 pt-16 max-w-2xl">
+      <div id="hero-kicker" class="text-[11px] font-bold uppercase tracking-[0.2em] text-sky-300 mb-2 flex items-center gap-2">
+        <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 11-14h-7l1-6Z"/></svg> Featured on Neura
       </div>
-      <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-2 gap-2 shrink-0">
-        <div class="glass rounded-xl px-3 py-2.5 text-center"><div class="text-lg font-extrabold text-fuchsia-400">6</div><div class="text-[10px] text-gray-500 uppercase tracking-wider">platforms</div></div>
-        <div class="glass rounded-xl px-3 py-2.5 text-center"><div class="text-lg font-extrabold text-cyan-400" id="stat-uploads">0</div><div class="text-[10px] text-gray-500 uppercase tracking-wider">uploads</div></div>
-        <div class="glass rounded-xl px-3 py-2.5 text-center"><div class="text-lg font-extrabold text-violet-400">0 keys</div><div class="text-[10px] text-gray-500 uppercase tracking-wider">API needed</div></div>
-        <div class="glass rounded-xl px-3 py-2.5 text-center"><div class="text-lg font-extrabold text-emerald-400">∞</div><div class="text-[10px] text-gray-500 uppercase tracking-wider">reels</div></div>
+      <h2 id="hero-title" class="text-3xl sm:text-5xl font-extrabold leading-tight mb-3 drop-shadow-2xl">Loading…</h2>
+      <p id="hero-meta" class="text-xs sm:text-sm text-gray-300 mb-6"></p>
+      <div class="flex flex-wrap items-center gap-3">
+        <button id="hero-play" class="flex items-center gap-2.5 px-7 py-3.5 rounded-xl font-bold text-sm bg-white text-slate-900 hover:bg-sky-200 transition shadow-2xl active:scale-95">
+          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
+          Play now
+        </button>
+        <button id="hero-copilot" class="flex items-center gap-2.5 px-6 py-3.5 rounded-xl font-semibold text-sm glass hover:bg-white/10 transition active:scale-95">
+          <svg class="w-5 h-5 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z"/></svg>
+          Ask co-pilot
+        </button>
       </div>
     </div>
   </section>
 
-  <section>
-    <div class="flex items-center justify-between mb-4">
-      <h3 class="font-bold text-sm uppercase tracking-widest text-gray-400 flex items-center gap-2">
-        <span class="w-1.5 h-1.5 rounded-full bg-fuchsia-400"></span> Community uploads
-      </h3>
-      <button id="btn-upload-2" class="text-xs text-fuchsia-400 hover:text-fuchsia-300 font-semibold">+ Upload yours</button>
-    </div>
-    <div id="uploads-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
-    <div id="uploads-empty" class="glass rounded-3xl p-10 text-center">
-      <div class="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-fuchsia-500/20 to-cyan-400/20 grid place-items-center mb-4">
-        <svg class="w-7 h-7 text-fuchsia-400" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
-      </div>
-      <p class="text-sm text-gray-400">No videos uploaded yet — be the first creator on Neura Stream.</p>
-      <button class="mt-4 px-5 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-fuchsia-500 to-fuchsia-600 shadow-lg shadow-fuchsia-500/30 hover:opacity-90 transition" id="empty-upload-btn">Upload a video</button>
-    </div>
+  <!-- SHELVES -->
+  <section class="max-w-[1700px] mx-auto px-4 sm:px-6 py-6 space-y-2" id="shelves-root">
+    <div id="browse-notice" class="hidden glass rounded-2xl px-5 py-3 text-xs text-gray-400"></div>
+    <div id="shelf-trending" class="shelf-slot"></div>
+    <div id="shelf-community" class="shelf-slot"></div>
+    <div id="shelf-movies" class="shelf-slot"></div>
+    <div id="shelf-shorts" class="shelf-slot"></div>
+    <div id="shelf-music" class="shelf-slot"></div>
   </section>
 
-  <section id="discover-section" class="hidden">
+  <!-- discover (web search results) -->
+  <section id="discover-section" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pb-10">
     <div class="flex items-center justify-between mb-4">
       <h3 class="font-bold text-sm uppercase tracking-widest text-gray-400 flex items-center gap-2">
-        <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span> <span id="discover-title">Discover from the web</span>
+        <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span> <span id="discover-title">Web results</span>
       </h3>
     </div>
     <div id="discover-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
@@ -919,9 +1153,9 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
 </main>
 
 <!-- ================= VIEW: WATCH ================= -->
-<main id="view-watch" class="view max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+<main id="view-watch" class="view max-w-[1700px] mx-auto px-4 sm:px-6 py-6">
   <button id="btn-back" class="chip mb-4 inline-flex items-center gap-2 text-sm text-gray-400 hover:text-white">
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg> Back to home
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg> Back to browse
   </button>
 
   <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
@@ -930,8 +1164,8 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
         <div id="player-shell" class="relative group bg-black select-none">
           <video id="video" class="w-full aspect-video max-h-[70vh] bg-black" playsinline preload="metadata"></video>
           <button id="big-play" class="absolute inset-0 grid place-items-center bg-black/20 opacity-0 group-hover:opacity-100 transition">
-            <span class="w-20 h-20 rounded-full bg-fuchsia-500/90 shadow-2xl shadow-fuchsia-500/50 grid place-items-center hover:scale-110 transition">
-              <svg class="w-9 h-9 text-white ml-1" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
+            <span class="w-20 h-20 rounded-full bg-sky-400/90 shadow-2xl shadow-sky-500/50 grid place-items-center hover:scale-110 transition">
+              <svg class="w-9 h-9 text-slate-900 ml-1" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
             </span>
           </button>
           <div class="absolute bottom-0 inset-x-0 px-4 pb-3 pt-10 bg-gradient-to-t from-black/85 via-black/40 to-transparent opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition">
@@ -974,13 +1208,13 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
 
       <div class="glass rounded-3xl p-5">
         <h4 class="font-bold text-sm mb-4 flex items-center gap-2 text-gray-300">
-          <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+          <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
           Comments <span id="c-count" class="text-gray-600 font-normal"></span>
         </h4>
         <form id="c-form" class="flex gap-2 mb-4">
-          <input id="c-author" placeholder="Your name (optional)" class="w-36 sm:w-44 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400/60 outline-none text-xs placeholder-gray-600">
-          <input id="c-body" placeholder="Add a comment…" required class="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400/60 outline-none text-xs placeholder-gray-600">
-          <button class="px-4 py-2 rounded-xl bg-cyan-400/20 border border-cyan-400/30 text-cyan-300 text-xs font-semibold hover:bg-cyan-400/30 transition">Post</button>
+          <input id="c-author" placeholder="Your name (optional)" class="w-36 sm:w-44 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-xs placeholder-gray-600">
+          <input id="c-body" placeholder="Add a comment…" required class="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-xs placeholder-gray-600">
+          <button class="px-4 py-2 rounded-xl bg-sky-400/20 border border-sky-400/30 text-sky-300 text-xs font-semibold hover:bg-sky-400/30 transition">Post</button>
         </form>
         <div id="c-list" class="space-y-3"></div>
       </div>
@@ -988,7 +1222,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
 
     <aside id="chat-panel" class="glass rounded-3xl flex-col overflow-hidden lg:sticky lg:top-24 h-[70vh] lg:h-[calc(100vh-8rem)] hidden lg:flex">
       <div class="px-5 py-4 border-b border-white/10 flex items-center gap-3">
-        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 to-fuchsia-500 grid place-items-center shadow-lg shadow-cyan-500/20">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center shadow-lg shadow-sky-500/20">
           <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15Z"/></svg>
         </div>
         <div><h3 class="font-bold text-sm">Co-pilot</h3><p class="text-[11px] text-gray-500">video & live-web synthesis</p></div>
@@ -997,7 +1231,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
       </div>
       <div id="chat-log" class="flex-1 overflow-y-auto p-4 space-y-4">
         <div class="msg-in flex gap-3">
-          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
+          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
           <div class="glass rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-gray-200 leading-relaxed max-w-[85%]">
             I see what you're watching. Ask me to summarize it, explain a part, or search the wider web.
           </div>
@@ -1008,8 +1242,8 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
         <button class="chat-chip chip shrink-0 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400">Find related videos</button>
       </div>
       <form id="chat-form" class="p-3 border-t border-white/10 flex gap-2">
-        <input id="chat-input" autocomplete="off" placeholder="Ask anything…" class="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400/60 focus:ring-2 focus:ring-cyan-400/20 outline-none text-sm placeholder-gray-600 transition">
-        <button class="px-4 py-3 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 hover:opacity-90 active:scale-95 transition shadow-lg shadow-fuchsia-500/20" aria-label="Send">
+        <input id="chat-input" autocomplete="off" placeholder="Ask anything…" class="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/20 outline-none text-sm placeholder-gray-600 transition">
+        <button class="px-4 py-3 rounded-xl bg-gradient-to-r from-sky-400 to-fuchsia-500 hover:opacity-90 active:scale-95 transition shadow-lg shadow-fuchsia-500/20" aria-label="Send">
           <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m22 2-7 20-4-9-9-4Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M22 2 11 13"/></svg>
         </button>
       </form>
@@ -1018,14 +1252,31 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
 </main>
 
 <!-- ================= VIEW: REELS ================= -->
-<main id="view-reels" class="view max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+<main id="view-reels" class="view max-w-[1700px] mx-auto px-4 sm:px-6 py-6">
   <div class="glass rounded-2xl px-4 py-3.5 mb-5 flex flex-col sm:flex-row items-center gap-3">
     <svg class="w-5 h-5 text-fuchsia-400 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 6l4 5m-4-5v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V6M8 11l4 6 4-6"/></svg>
-    <p class="text-xs text-gray-400 flex-1 text-center sm:text-left">Vertical short-video feed — community uploads play here Instagram-style. Scroll or use arrows.</p>
-    <input id="reel-url-input" placeholder="Paste any reel URL to add…" class="w-full sm:w-72 px-3.5 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-xs placeholder-gray-600">
+    <p class="text-xs text-gray-400 flex-1 text-center sm:text-left">Shorts & reels — YouTube Shorts search se browse karo, ya kisi bhi platform ka reel link paste karo. Community uploads bhi isi feed mein autoplay hote hain.</p>
+  </div>
+
+  <div class="glass rounded-2xl p-4 mb-5">
+    <div class="flex gap-2 mb-4">
+      <input id="shorts-search" placeholder="Search YouTube Shorts… (e.g. funny, dance, ipl)" class="flex-1 px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600">
+      <button id="shorts-btn" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-fuchsia-500 to-fuchsia-600 text-sm font-semibold shadow-lg shadow-fuchsia-500/30 hover:opacity-90 transition">Search</button>
+    </div>
+    <div id="shorts-grid" class="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2.5"></div>
+  </div>
+
+  <div class="flex items-center gap-2 mb-3 px-1">
+    <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+    <h3 class="font-bold text-sm uppercase tracking-widest text-gray-400">Community reels feed</h3>
+    <span class="text-xs text-gray-600 ml-2">(vertical scroll, autoplay)</span>
   </div>
   <div id="reel-track" class="reel-track glass rounded-3xl overflow-y-auto h-[75vh] snap-y relative"></div>
-  <p id="reels-empty" class="hidden text-center text-sm text-gray-500 py-16">No reels yet — upload a short video and it lands here too.</p>
+  <p id="reels-empty" class="hidden text-center text-sm text-gray-500 py-16">No community reels yet — upload a short video and it lands here too.</p>
+
+  <div class="glass rounded-2xl px-4 py-3.5 mt-5 flex flex-col sm:flex-row items-center gap-3">
+    <input id="reel-url-input" placeholder="Paste any Instagram / Facebook / X reel URL to add…" class="w-full sm:w-96 px-3.5 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-xs placeholder-gray-600">
+  </div>
 </main>
 
 <!-- ================= UPLOAD MODAL ================= -->
@@ -1036,10 +1287,10 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
       <button id="upload-close" class="p-2 rounded-lg hover:bg-white/10"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
     </div>
 
-    <div id="drop-zone" class="drop-zone border-2 border-dashed border-white/15 rounded-2xl p-8 text-center cursor-pointer hover:border-fuchsia-500/50 transition mb-4">
+    <div id="drop-zone" class="drop-zone border-2 border-dashed border-white/15 rounded-2xl p-8 text-center cursor-pointer hover:border-sky-400/50 transition mb-4">
       <input id="file-input" type="file" accept="video/*" class="hidden">
-      <div class="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-fuchsia-500/20 to-cyan-400/20 grid place-items-center mb-3">
-        <svg class="w-7 h-7 text-fuchsia-400" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
+      <div class="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-sky-400/20 to-fuchsia-400/20 grid place-items-center mb-3">
+        <svg class="w-7 h-7 text-sky-300" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
       </div>
       <p class="text-sm text-gray-300 font-semibold" id="drop-title">Drop your video here or click to browse</p>
       <p class="text-xs text-gray-600 mt-1">MP4 / WebM / MKV · up to 200 MB · poster frame is auto-captured</p>
@@ -1048,32 +1299,84 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
     </div>
 
     <div class="space-y-3">
-      <input id="up-title" placeholder="Title *" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600">
-      <input id="up-uploader" placeholder="Channel name (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600">
-      <textarea id="up-desc" rows="2" placeholder="Description (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600 resize-none"></textarea>
+      <input id="up-title" placeholder="Title *" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
+      <input id="up-uploader" placeholder="Channel name (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
+      <textarea id="up-desc" rows="2" placeholder="Description (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600 resize-none"></textarea>
     </div>
 
     <div id="up-progress" class="hidden mt-4">
-      <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="up-bar" class="h-full w-0 bg-gradient-to-r from-fuchsia-500 to-cyan-400 transition-all"></div></div>
+      <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="up-bar" class="h-full w-0 bg-gradient-to-r from-sky-400 to-fuchsia-400 transition-all"></div></div>
       <p id="up-pct" class="text-xs text-gray-400 mt-1.5 text-center">0%</p>
     </div>
 
-    <button id="up-submit" class="w-full mt-5 py-3.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-fuchsia-500 to-fuchsia-600 shadow-lg shadow-fuchsia-500/30 hover:opacity-90 active:scale-[.98] transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>Upload</button>
+    <button id="up-submit" class="w-full mt-5 py-3.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-sky-500 text-slate-900 shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>Upload</button>
     <p class="text-[10px] text-gray-600 text-center mt-3">Free-tier note: storage is ephemeral — uploads reset when the server restarts.</p>
   </div>
 </div>
 
-<footer class="max-w-[1600px] mx-auto px-6 py-8 text-center text-[11px] text-gray-600">
-  Neura Stream · single-file FastAPI · yt-dlp + DDG + heuristic co-pilot · uploads on SQLite · Render free tier
+<footer class="max-w-[1700px] mx-auto px-6 py-8 text-center text-[11px] text-gray-600">
+  neura prime · single-file FastAPI · keyless yt-dlp browse + DDG + co-pilot · Render free tier
 </footer>
+
+<!-- ================= LIGHT THEME OVERRIDES ================= -->
+<style>
+  html.light body{background:#eef1f8;color:#0f172a}
+  html.light .glass{background:rgba(255,255,255,.66);border-color:rgba(15,23,42,.09);backdrop-filter:blur(14px)}
+  html.light .text-gray-100{color:#0f172a}
+  html.light .text-gray-200{color:#1e293b}
+  html.light .text-gray-300{color:#334155}
+  html.light .text-gray-400{color:#475569}
+  html.light .text-gray-500{color:#64748b}
+  html.light .text-gray-600{color:#94a3b8}
+  html.light .bg-white\/5{background:rgba(15,23,42,.05)}
+  html.light .bg-white\/10{background:rgba(15,23,42,.08)}
+  html.light .border-white\/10{border-color:rgba(15,23,42,.12)}
+  html.light .border-white\/15{border-color:rgba(15,23,42,.16)}
+  html.light .hero-fade-b{background:linear-gradient(to top,#eef1f8 5%,rgba(238,241,248,.6) 40%,transparent 90%)}
+  html.light .hero-fade-l{background:linear-gradient(to right,rgba(238,241,248,.95) 0%,rgba(238,241,248,.55) 38%,transparent 75%)}
+  html.light .nav-solid{background:rgba(238,241,248,.94)!important;border-color:rgba(15,23,42,.1)!important}
+  html.light #top-nav{border-color:transparent}
+  html.light .drop-zone{background:rgba(255,255,255,.5)}
+  html.light .shelf .poster{background:rgba(15,23,42,.06)}
+</style>
+
+<!-- ================= AUTH MODAL (email OTP) ================= -->
+<div id="auth-modal" class="hidden fixed inset-0 z-50 grid place-items-center p-4 bg-black/70 backdrop-blur-sm">
+  <div class="glass rounded-3xl w-full max-w-sm p-6 animate-fadeUp">
+    <div class="flex items-center justify-between mb-1">
+      <h3 class="font-bold text-lg" id="auth-title">Sign in to Neura</h3>
+      <button id="auth-close" class="p-2 rounded-lg hover:bg-white/10"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
+    </div>
+    <p class="text-xs text-gray-500 mb-5" id="auth-sub">Email par OTP aayega — Gmail bhi chalega.</p>
+
+    <div id="auth-step-1" class="space-y-3">
+      <input id="auth-email" type="email" autocomplete="email" placeholder="your.name@gmail.com"
+        class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
+      <input id="auth-name" placeholder="Your name (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
+      <button id="auth-send" class="w-full py-3 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-sky-500 text-slate-900 shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition">Send code</button>
+    </div>
+
+    <div id="auth-step-2" class="hidden space-y-3">
+      <input id="auth-code" inputmode="numeric" maxlength="6" placeholder="6-digit code"
+        class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-center text-2xl tracking-[0.5em] font-bold placeholder:text-base placeholder:tracking-normal placeholder:text-sm placeholder-gray-600">
+      <button id="auth-verify" class="w-full py-3 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-fuchsia-500 text-white shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition">Verify & continue</button>
+      <button id="auth-back" class="w-full py-2 text-xs text-gray-500 hover:text-sky-400 transition">&larr; change email</button>
+    </div>
+
+    <div id="auth-dev-note" class="hidden mt-4 glass rounded-xl p-3 text-xs text-amber-300 leading-relaxed"></div>
+    <p class="text-[10px] text-gray-600 text-center mt-4">Codes are sent from Neura Studio <no-reply@neurastudio.official.com></p>
+  </div>
+</div>
 <script>
 /* ================= state & helpers ================= */
 const $ = (id) => document.getElementById(id);
-let currentMedia = null;        // watch context (local or remote)
-let currentStreams = [];        // remote formats
+let currentMedia = null;
+let currentStreams = [];
 let lastSearchResults = [];
 let reelsObserver = null;
 let uploadCtx = { file: null, thumb: '', duration: 0 };
+let heroItem = null;
+let currentUser = null;
 
 const isUrl = (s) => /^https?:\/\/\S+\.\S+/i.test(s.trim());
 const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
@@ -1091,6 +1394,97 @@ function setStatus(msg) { if (!msg) { $('status-bar').classList.add('hidden'); r
 function showError(msg) { $('error-text').textContent = msg; $('error-bar').classList.remove('hidden');
   setTimeout(() => $('error-bar').classList.add('hidden'), 9000); }
 
+/* ================= theme (dark / light) ================= */
+function applyTheme(mode) {
+  document.documentElement.classList.toggle('light', mode === 'light');
+  document.documentElement.classList.toggle('dark', mode !== 'light');
+  $('ic-sun').classList.toggle('hidden', mode !== 'light');
+  $('ic-moon').classList.toggle('hidden', mode === 'light');
+  localStorage.setItem('neura-theme', mode);
+}
+$('theme-toggle').addEventListener('click', () =>
+  applyTheme(localStorage.getItem('neura-theme') === 'light' ? 'dark' : 'light'));
+applyTheme(localStorage.getItem('neura-theme') || 'dark');
+
+/* ================= auth (email OTP) ================= */
+function openAuth() { $('auth-modal').classList.remove('hidden'); $('auth-step-1').classList.remove('hidden');
+  $('auth-step-2').classList.add('hidden'); $('auth-dev-note').classList.add('hidden'); }
+function closeAuth() { $('auth-modal').classList.add('hidden'); }
+$('auth-zone-btn').addEventListener('click', () => {
+  if (currentUser) { showView('watch'); $('chat-panel').classList.remove('hidden'); }
+  else openAuth();
+});
+$('auth-close').addEventListener('click', closeAuth);
+$('auth-modal').addEventListener('click', e => { if (e.target === $('auth-modal')) closeAuth(); });
+
+async function authSendCode() {
+  const email = $('auth-email').value.trim();
+  if (!email) return;
+  $('auth-send').disabled = true; $('auth-send').textContent = 'Sending…';
+  try {
+    const res = await fetch('/api/auth/request-otp', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+    const d = await res.json();
+    if (d.error) { showError(d.message); return; }
+    $('auth-step-1').classList.add('hidden');
+    $('auth-step-2').classList.remove('hidden');
+    $('auth-sub').textContent = 'Code sent to ' + email + ' — check your inbox (and spam).';
+    if (d.dev_otp) {
+      const note = $('auth-dev-note');
+      note.classList.remove('hidden');
+      note.textContent = 'SMTP not configured on this server, so your code is shown here: ' + d.dev_otp;
+    }
+  } catch (e) { showError('Could not send code: ' + e.message); }
+  finally { $('auth-send').disabled = false; $('auth-send').textContent = 'Send code'; }
+}
+$('auth-send').addEventListener('click', authSendCode);
+$('auth-email').addEventListener('keydown', e => { if (e.key === 'Enter') authSendCode(); });
+
+async function authVerify() {
+  const email = $('auth-email').value.trim(), code = $('auth-code').value.trim();
+  if (!code) return;
+  $('auth-verify').disabled = true; $('auth-verify').textContent = 'Verifying…';
+  try {
+    const res = await fetch('/api/auth/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code, name: $('auth-name').value.trim() })
+    });
+    const d = await res.json();
+    if (d.error) { showError(d.message); return; }
+    closeAuth();
+    await refreshUser();
+  } catch (e) { showError('Verify failed: ' + e.message); }
+  finally { $('auth-verify').disabled = false; $('auth-verify').textContent = 'Verify & continue'; }
+}
+$('auth-verify').addEventListener('click', authVerify);
+$('auth-code').addEventListener('keydown', e => { if (e.key === 'Enter') authVerify(); });
+$('auth-back').addEventListener('click', () => { $('auth-step-1').classList.remove('hidden');
+  $('auth-step-2').classList.add('hidden'); $('auth-dev-note').classList.add('hidden'); });
+
+async function refreshUser() {
+  try {
+    const d = await (await fetch('/api/auth/me')).json();
+    currentUser = d.user;
+    const label = $('auth-zone-label');
+    if (currentUser) {
+      label.textContent = currentUser.name.split(' ')[0];
+      label.title = currentUser.email + ' — click to open co-pilot. Double-click to sign out.';
+      if ($('c-author')) { $('c-author').value = currentUser.name; $('c-author').readOnly = true; }
+      if ($('up-uploader')) { $('up-uploader').value = currentUser.name; $('up-uploader').readOnly = true; }
+    }
+  } catch (e) {}
+}
+$('auth-zone-btn').addEventListener('dblclick', async () => {
+  if (!currentUser) return;
+  await fetch('/api/auth/logout', { method: 'POST' });
+  currentUser = null;
+  $('auth-zone-label').textContent = 'Sign in';
+  if ($('c-author')) { $('c-author').value = ''; $('c-author').readOnly = false; }
+  if ($('up-uploader')) { $('up-uploader').value = ''; $('up-uploader').readOnly = false; }
+});
+
 /* ================= view router ================= */
 function showView(v) {
   ['home','watch','reels'].forEach(x => $('view-'+x).classList.toggle('active', x === v));
@@ -1103,6 +1497,9 @@ $('tab-home').addEventListener('click', () => showView('home'));
 $('tab-reels').addEventListener('click', () => { showView('reels'); loadReels(); });
 $('nav-home').addEventListener('click', () => showView('home'));
 $('btn-back').addEventListener('click', () => showView('home'));
+window.addEventListener('scroll', () => {
+  $('top-nav').classList.toggle('nav-solid', window.scrollY > 40);
+});
 
 /* ================= search router ================= */
 function handleQuery(v) {
@@ -1112,39 +1509,98 @@ function handleQuery(v) {
 }
 $('main-form').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input').value); $('main-input').value=''; });
 $('main-form-m').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input-m').value); $('main-input-m').value=''; });
-document.querySelectorAll('.demo').forEach(b => b.addEventListener('click', () => handleQuery(b.dataset.q)));
 
-/* ================= home: uploads grid ================= */
+/* ================= Prime-style shelves ================= */
+const SHELVES = [
+  { slot: 'shelf-trending',  title: 'Trending now',                q: 'trending videos today', n: 24 },
+  { slot: 'shelf-movies',    title: 'Full movies — free to watch', q: 'full movie',            n: 24 },
+  { slot: 'shelf-shorts',    title: 'Shorts & quick bites',         q: 'youtube shorts',        n: 24 },
+  { slot: 'shelf-music',     title: 'Music videos',                q: 'official music video',   n: 24 },
+];
+
+function posterCard(item) {
+  const card = document.createElement('div');
+  card.className = 'poster relative shrink-0 w-44 sm:w-56 aspect-video rounded-xl overflow-hidden cursor-pointer bg-white/5 border border-white/10';
+  const thumb = item.thumbnail
+    ? `<img src="${esc(item.thumbnail)}" class="w-full h-full object-cover" loading="lazy">`
+    : `<div class="w-full h-full bg-gradient-to-br from-sky-500/20 to-fuchsia-500/20"></div>`;
+  card.innerHTML = `
+    ${thumb}
+    <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-black/80 text-[10px] font-semibold tabular-nums">${esc(item.duration_label || '')}</span>
+    <div class="ph-over absolute inset-0 bg-gradient-to-t from-black/90 via-black/30 to-transparent flex flex-col justify-end p-3">
+      <span class="w-10 h-10 rounded-full bg-sky-400 text-slate-900 grid place-items-center mb-2 shadow-lg">
+        <svg class="w-5 h-5 ml-0.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
+      </span>
+      <p class="text-xs font-bold leading-snug line-clamp-2">${esc(item.title)}</p>
+      <p class="text-[10px] text-gray-400 mt-0.5 line-clamp-1">${esc(item.uploader || '')}${item.view_count ? ' · ' + fmtViews(item.view_count) + ' views' : ''}</p>
+    </div>`;
+  card.addEventListener('click', () => item.kind === 'local' ? openLocal(item.id) : openRemote(item.url));
+  return card;
+}
+
+function buildShelf(slotId, title, items) {
+  const slot = $(slotId);
+  slot.innerHTML = '';
+  if (!items || !items.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'mb-6';
+  wrap.innerHTML = `
+    <div class="flex items-center justify-between mb-3 px-1">
+      <h3 class="font-bold text-sm sm:text-base uppercase tracking-widest text-gray-300 flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span> ${esc(title)}
+      </h3>
+      <div class="flex gap-1.5">
+        <button class="scroll-l p-2 rounded-lg glass hover:bg-white/10 transition"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg></button>
+        <button class="scroll-r p-2 rounded-lg glass hover:bg-white/10 transition"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>
+      </div>
+    </div>
+    <div class="shelf flex gap-3.5 overflow-x-auto pb-2 no-scrollbar"></div>`;
+  const row = wrap.querySelector('.shelf');
+  items.forEach(it => row.appendChild(posterCard(it)));
+  const STEP = 600;
+  wrap.querySelector('.scroll-l').addEventListener('click', () => row.scrollBy({ left: -STEP, behavior: 'smooth' }));
+  wrap.querySelector('.scroll-r').addEventListener('click', () => row.scrollBy({ left: STEP, behavior: 'smooth' }));
+  slot.appendChild(wrap);
+}
+
+async function browseShelf(cfg) {
+  try {
+    const res = await fetch('/api/browse?q=' + encodeURIComponent(cfg.q) + '&n=' + cfg.n);
+    const data = await res.json();
+    if (data.error) { buildShelf(cfg.slot, cfg.title, []); return null; }
+    buildShelf(cfg.slot, cfg.title, data.items || []);
+    return data.items || [];
+  } catch (e) { return null; }
+}
+
+function renderHero(item) {
+  if (!item) return;
+  heroItem = item;
+  const hero = $('hero');
+  if (item.thumbnail) hero.style.backgroundImage = `url('${item.thumbnail}')`;
+  $('hero-title').textContent = item.title;
+  $('hero-meta').textContent = [item.uploader, item.view_count ? fmtViews(item.view_count) + ' views' : '',
+    item.duration_label ? item.duration_label + ' long' : ''].filter(Boolean).join(' · ');
+}
+$('hero-play').addEventListener('click', () => { if (heroItem) openRemote(heroItem.url); });
+$('hero-copilot').addEventListener('click', () => { showView('watch'); $('chat-panel').classList.remove('hidden'); });
+
 async function loadHome() {
+  setStatus('Filling your shelves — keyless YouTube browse…');
+  const trending = await browseShelf(SHELVES[0]);
+  if (trending && trending.length) renderHero(trending[0]);
   try {
     const res = await fetch('/api/videos');
     const data = await res.json();
-    $('stat-uploads').textContent = data.total;
-    const grid = $('uploads-grid'); grid.innerHTML = '';
-    const has = data.videos && data.videos.length;
-    $('uploads-empty').classList.toggle('hidden', !!has);
-    (data.videos || []).forEach(v => grid.appendChild(videoCard(v)));
-  } catch (e) { showError('Could not load uploads: ' + e.message); }
-}
-
-function videoCard(v) {
-  const card = document.createElement('div');
-  card.className = 'glass card-hover rounded-2xl overflow-hidden cursor-pointer group';
-  const thumbInner = v.thumb
-    ? `<img src="${esc(v.thumb)}" class="w-full aspect-video object-cover group-hover:scale-[1.03] transition duration-300" loading="lazy">`
-    : `<div class="w-full aspect-video bg-gradient-to-br from-fuchsia-600/30 via-violet-700/20 to-cyan-500/25 grid place-items-center">
-         <svg class="w-10 h-10 text-white/50" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg></div>`;
-  card.innerHTML = `
-    <div class="relative">${thumbInner}
-      <span class="absolute bottom-2 right-2 px-1.5 py-0.5 rounded-md bg-black/80 text-[10px] font-semibold tabular-nums">${esc(v.duration_label || '0:00')}</span>
-    </div>
-    <div class="p-3.5">
-      <h4 class="text-sm font-semibold leading-snug line-clamp-2 group-hover:text-fuchsia-300 transition">${esc(v.title)}</h4>
-      <p class="text-xs text-gray-500 mt-1.5">${esc(v.uploader)}</p>
-      <p class="text-xs text-gray-600 mt-0.5">${fmtViews(v.views)} views · ${timeAgo(v.created_at)} · <span class="text-pink-400">${v.likes} likes</span></p>
-    </div>`;
-  card.addEventListener('click', () => openLocal(v.id));
-  return card;
+    if (data.videos && data.videos.length) buildShelf('shelf-community', 'Your uploads — community', data.videos);
+  } catch (e) {}
+  await Promise.all(SHELVES.slice(1).map(browseShelf));
+  const anyEmpty = SHELVES.every(s => !$(s.slot).querySelector('.shelf'));
+  if (anyEmpty) {
+    const n = $('browse-notice'); n.classList.remove('hidden');
+    n.textContent = "YouTube shelves are empty right now (bot-check or network hiccup). Search or paste a link directly — playback still works.";
+  }
+  setStatus(null);
 }
 
 /* ================= watch: local video ================= */
@@ -1229,9 +1685,9 @@ function renderComments(list) {
   list.forEach(c => {
     const el = document.createElement('div');
     el.className = 'msg-in flex gap-3';
-    el.innerHTML = `<div class="w-8 h-8 rounded-full shrink-0 bg-gradient-to-br from-fuchsia-500 to-cyan-400 grid place-items-center text-[10px] font-bold">${esc((c.author||'?')[0].toUpperCase())}</div>
+    el.innerHTML = `<div class="w-8 h-8 rounded-full shrink-0 bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center text-[10px] font-bold">${esc((c.author||'?')[0].toUpperCase())}</div>
       <div class="glass rounded-xl rounded-tl-sm px-3.5 py-2.5 max-w-[85%]">
-        <p class="text-xs font-semibold text-fuchsia-300">${esc(c.author)} <span class="text-gray-600 font-normal">· ${timeAgo(c.created_at)}</span></p>
+        <p class="text-xs font-semibold text-sky-300">${esc(c.author)} <span class="text-gray-600 font-normal">· ${timeAgo(c.created_at)}</span></p>
         <p class="text-sm text-gray-300 mt-0.5 break-words">${esc(c.body)}</p>
       </div>`;
     box.appendChild(el);
@@ -1301,17 +1757,20 @@ async function doSearch(q) {
     items.forEach(item => {
       const isVideoish = /youtu\.?be|instagram|fb\.watch|facebook\.com\/.*\/videos|twitter\.com|x\.com|t\.me/i.test(item.url || '');
       const card = document.createElement('div');
-      card.className = 'glass card-hover rounded-2xl p-4 cursor-pointer flex flex-col gap-2';
+      card.className = 'glass rounded-2xl p-4 cursor-pointer flex flex-col gap-2';
+      card.style.transition = 'all .2s ease';
+      card.onmouseenter = () => { card.style.transform = 'translateY(-3px)'; card.style.borderColor = 'rgba(14,165,233,.35)'; };
+      card.onmouseleave = () => { card.style.transform = ''; card.style.borderColor = ''; };
       card.innerHTML = `
         <div class="flex items-center gap-2 text-[10px] uppercase tracking-wider">
-          <span class="px-2 py-0.5 rounded-full ${item.kind==='news'?'bg-cyan-500/15 text-cyan-300':'bg-fuchsia-500/15 text-fuchsia-300'}">${item.kind}</span>
+          <span class="px-2 py-0.5 rounded-full ${item.kind==='news'?'bg-sky-500/15 text-sky-300':'bg-fuchsia-500/15 text-fuchsia-300'}">${item.kind}</span>
           <span class="text-gray-600 truncate">${esc(item.source||'')}</span>
         </div>
         <h4 class="text-sm font-semibold leading-snug line-clamp-2">${esc(item.title)}</h4>
         <p class="text-xs text-gray-500 line-clamp-3 leading-relaxed">${esc(item.body||'')}</p>
         <div class="mt-auto pt-2 flex items-center gap-2">
           ${isVideoish ? '<button class="play-here px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 hover:bg-fuchsia-500/30 transition">Play here</button>' : ''}
-          <a href="${esc(item.url)}" target="_blank" rel="noopener" class="ml-auto text-[11px] text-gray-500 hover:text-cyan-300 underline underline-offset-2">open</a>
+          <a href="${esc(item.url)}" target="_blank" rel="noopener" class="ml-auto text-[11px] text-gray-500 hover:text-sky-300 underline underline-offset-2">open</a>
         </div>`;
       if (isVideoish) card.querySelector('.play-here').addEventListener('click', ev => { ev.stopPropagation(); openRemote(item.url); });
       card.addEventListener('click', ev => { if (ev.target.tagName === 'A' || ev.target.closest('button')) return; window.open(item.url, '_blank', 'noopener'); });
@@ -1324,7 +1783,7 @@ async function doSearch(q) {
   } catch (err) { setStatus(null); showError('Search failed: ' + err.message); }
 }
 
-/* ================= reels (Instagram-style) ================= */
+/* ================= reels ================= */
 async function loadReels() {
   const track = $('reel-track');
   try {
@@ -1361,7 +1820,7 @@ function buildReel(v) {
         <svg class="w-5 h-5 text-pink-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 22V11l5-9a3 3 0 0 1 3 3v4h4.5a2 2 0 0 1 2 2.4l-1.6 8A2 2 0 0 1 18 22H7Z"/><path d="M7 11H4v11h3"/></svg>
       </button>
       <button class="reel-open w-11 h-11 rounded-full glass grid place-items-center hover:scale-110 transition" title="Open & comment">
-        <svg class="w-5 h-5 text-cyan-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+        <svg class="w-5 h-5 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
       </button>
     </div>`;
   const vid = item.querySelector('video');
@@ -1376,7 +1835,37 @@ function buildReel(v) {
   return item;
 }
 
-/* ================= reel from remote URL ================= */
+async function searchShorts(q) {
+  if (!q.trim()) return;
+  setStatus('Searching YouTube Shorts (no API)…');
+  try {
+    const res = await fetch('/api/browse?q=' + encodeURIComponent(q + ' shorts') + '&n=32');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const items = (data.items || []).filter(it => (it.duration || 0) <= 300);
+    const grid = $('shorts-grid'); grid.innerHTML = '';
+    if (!items.length) { grid.innerHTML = '<p class="col-span-full text-xs text-gray-500 text-center py-4">No shorts found — try another keyword.</p>'; setStatus(null); return; }
+    items.forEach(it => {
+      const c = document.createElement('div');
+      c.className = 'poster relative rounded-xl overflow-hidden cursor-pointer bg-white/5 border border-white/10 aspect-[9/16]';
+      c.innerHTML = `
+        ${it.thumbnail ? `<img src="${esc(it.thumbnail)}" class="w-full h-full object-cover" loading="lazy">` : '<div class="w-full h-full bg-gradient-to-br from-fuchsia-500/20 to-sky-500/20"></div>'}
+        <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-black/80 text-[10px] font-semibold tabular-nums">${esc(it.duration_label || '')}</span>
+        <div class="ph-over absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent flex flex-col justify-end p-2">
+          <span class="w-8 h-8 rounded-full bg-fuchsia-500 text-white grid place-items-center mb-1.5 mx-auto shadow-lg">
+            <svg class="w-4 h-4 ml-0.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
+          </span>
+          <p class="text-[10px] font-bold leading-tight line-clamp-2 text-center">${esc(it.title)}</p>
+        </div>`;
+      c.addEventListener('click', () => openRemote(it.url));
+      grid.appendChild(c);
+    });
+    setStatus(null);
+  } catch (e) { setStatus(null); showError('Shorts search failed: ' + e.message); }
+}
+$('shorts-btn').addEventListener('click', () => searchShorts($('shorts-search').value));
+$('shorts-search').addEventListener('keydown', e => { if (e.key === 'Enter') searchShorts($('shorts-search').value); });
+
 $('reel-url-input').addEventListener('change', async () => {
   const url = $('reel-url-input').value.trim();
   if (!isUrl(url)) return;
@@ -1407,8 +1896,6 @@ $('reel-url-input').addEventListener('change', async () => {
 const openModal = () => { $('upload-modal').classList.remove('hidden'); };
 const closeModal = () => { $('upload-modal').classList.add('hidden'); };
 $('btn-upload').addEventListener('click', openModal);
-$('btn-upload-2').addEventListener('click', openModal);
-$('empty-upload-btn').addEventListener('click', openModal);
 $('upload-close').addEventListener('click', closeModal);
 $('upload-modal').addEventListener('click', e => { if (e.target === $('upload-modal')) closeModal(); });
 const dz = $('drop-zone');
@@ -1463,7 +1950,8 @@ $('up-submit').addEventListener('click', () => {
       const d = JSON.parse(xhr.responseText);
       if (d.error) { showError(d.message); return; }
       closeModal();
-      $('up-title').value = ''; $('up-desc').value = ''; $('up-uploader').value = '';
+      $('up-title').value = ''; $('up-desc').value = '';
+      if (!currentUser) $('up-uploader').value = '';
       $('thumb-preview').classList.add('hidden');
       $('drop-title').textContent = 'Drop your video here or click to browse';
       uploadCtx = { file: null, thumb: '', duration: 0 }; $('up-submit').disabled = true;
@@ -1483,11 +1971,11 @@ function appendMsg(role, text, sources) {
   const body = text.split('\n').map(l => esc(l)).join('<br>');
   const srcHtml = (sources && sources.length)
     ? '<div class="mt-2 pt-2 border-t border-white/10 space-y-1">' + sources.map(s =>
-        `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="block text-[11px] text-cyan-400/80 hover:text-cyan-300 truncate">${esc(s.title || s.url)}</a>`).join('') + '</div>'
+        `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="block text-[11px] text-sky-400/80 hover:text-sky-300 truncate">${esc(s.title || s.url)}</a>`).join('') + '</div>'
     : '';
   wrap.innerHTML = role === 'user'
-    ? `<div class="rounded-2xl rounded-tr-sm px-4 py-3 text-sm bg-fuchsia-500/20 border border-fuchsia-500/30 max-w-[85%] leading-relaxed">${body}</div>`
-    : `<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
+    ? `<div class="rounded-2xl rounded-tr-sm px-4 py-3 text-sm bg-sky-400/20 border border-sky-400/30 max-w-[85%] leading-relaxed">${body}</div>`
+    : `<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
        <div class="glass rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-gray-200 leading-relaxed max-w-[85%]">${body}${srcHtml}</div>`;
   log.appendChild(wrap);
   log.scrollTop = log.scrollHeight;
@@ -1530,6 +2018,7 @@ $('chat-toggle').addEventListener('click', () => {
 $('chat-close').addEventListener('click', () => $('chat-panel').classList.add('hidden'));
 
 /* ================= boot ================= */
+refreshUser();
 loadHome();
 </script>
 </body>
@@ -1544,7 +2033,7 @@ async def index():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "4.0.0"}
 
 
 # --------------------------------------------------------------------------- #
