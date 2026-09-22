@@ -28,6 +28,10 @@
  from console.cloud.google.com and the browse shelves upgrade to the official
  API with zero code changes. Without it, everything stays 100% keyless.
 
+ UPLOADS: local disk by default (ephemeral). Set SUPABASE_URL +
+ SUPABASE_SERVICE_KEY (+ SUPABASE_BUCKET, default "uploads") and videos up to
+ 500 MB are stored in a free Supabase cloud bucket — permanent, restart-safe.
+
  NO PAID SERVICES. NO BUILD STEP. ONE FILE.
 ================================================================================
 """
@@ -66,7 +70,7 @@ app = FastAPI(
     title="Neura Stream",
     description="Hybrid video platform: uploads, reels, multi-platform extraction, "
     "live web search and an AI co-pilot — zero API keys.",
-    version="6.1.0",
+    version="7.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -83,7 +87,15 @@ DB_PATH = BASE_DIR / "neura.db"
 UPLOAD_DIR.mkdir(exist_ok=True)
 THUMB_DIR.mkdir(exist_ok=True)
 
-MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB cap (ephemeral free-tier disk)
+# Storage: local disk (ephemeral) OR Supabase Storage (free 1GB, permanent).
+# Set SUPABASE_URL + SUPABASE_SERVICE_KEY env vars and uploads go to the cloud
+# bucket instead of the code container — up to 500 MB per video, restart-safe.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "uploads")
+MAX_UPLOAD_LOCAL = 200 * 1024 * 1024    # when stored in the container
+MAX_UPLOAD_CLOUD = 500 * 1024 * 1024   # when stored in Supabase
+MAX_UPLOAD_BYTES = MAX_UPLOAD_CLOUD if (SUPABASE_URL and SUPABASE_KEY) else MAX_UPLOAD_LOCAL
 
 YDL_OPTS: Dict[str, Any] = {
     "quiet": True,
@@ -214,7 +226,8 @@ def _video_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "views": row["views"],
         "likes": row["likes"],
         "created_at": row["created_at"],
-        "webpage_url": f"/media/{row['filename']}",
+        "webpage_url": row["filename"] if row["filename"].startswith("http") else f"/media/{row['filename']}",
+        "stored": "cloud" if row["filename"].startswith("http") else "local",
         "extractor": "Neura upload",
     }
 
@@ -304,6 +317,28 @@ def _save_data_url_thumbnail(data_url: str, vid: str) -> Optional[str]:
         return None
 
 
+async def _supabase_upload(path: Path, name: str, ctype: str) -> Optional[str]:
+    """PUT a local temp file into the Supabase storage bucket; return public URL."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "apikey": SUPABASE_KEY,
+            "Content-Type": ctype or "video/mp4",
+            "x-upsert": "true",
+        }
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            with path.open("rb") as fh:
+                r = await client.put(
+                    f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{name}",
+                    headers=headers, content=fh,
+                )
+        if r.status_code in (200, 201):
+            return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{name}"
+        return None
+    except Exception:
+        return None
+
+
 @app.post("/api/upload")
 async def api_upload(
     file: UploadFile = File(...),
@@ -328,6 +363,7 @@ async def api_upload(
         ext = ".mp4"
     dest = UPLOAD_DIR / f"{vid}{ext}"
     written = 0
+    limit_mb = "500" if (SUPABASE_URL and SUPABASE_KEY) else "200"
     try:
         with dest.open("wb") as out:
             while True:
@@ -336,7 +372,8 @@ async def api_upload(
                     break
                 written += len(chunk)
                 if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="File exceeds the 200 MB limit.")
+                    raise HTTPException(status_code=413,
+                                        detail=f"File exceeds the {limit_mb} MB limit.")
                 out.write(chunk)
     except HTTPException:
         dest.unlink(missing_ok=True)
@@ -351,12 +388,20 @@ async def api_upload(
         dest.unlink(missing_ok=True)
         return {"error": "empty", "message": "The selected file was empty."}
 
+    stored_name = dest.name
+    if SUPABASE_URL and SUPABASE_KEY:
+        # push to external cloud storage (permanent), then drop the local copy
+        remote = await _supabase_upload(dest, dest.name, ctype="video/mp4")
+        dest.unlink(missing_ok=True)
+        if remote:
+            stored_name = remote
+
     thumb_name = _save_data_url_thumbnail(thumbnail, vid)
     with _db() as conn:
         conn.execute(
             "INSERT INTO videos (id, title, description, uploader, filename, thumb, duration, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (vid, title, description, uploader, dest.name, thumb_name, float(duration or 0), time.time()),
+            (vid, title, description, uploader, stored_name, thumb_name, float(duration or 0), time.time()),
         )
     with _db() as conn:
         row = conn.execute("SELECT * FROM videos WHERE id = ?", (vid,)).fetchone()
@@ -1227,8 +1272,8 @@ FRONTEND = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NeuraTube</title>
-<meta name="description" content="NeuraTube — YouTube-style streaming platform with YouTube content, own uploads, Shorts, reels and AI co-pilot.">
+<title>NeuraStream</title>
+<meta name="description" content="NeuraStream — YouTube-style streaming platform with YouTube content, own uploads, Shorts, reels and AI co-pilot.">
 <meta name="theme-color" content="#0f0f0f">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z' fill='%23ff0033'/%3E%3C/svg%3E">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -1307,7 +1352,7 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
   </button>
   <button id="nav-home" class="flex items-center gap-1 shrink-0 pr-2">
     <svg class="w-7 h-7" viewBox="0 0 24 24"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z" fill="#ff0033"/></svg>
-    <span class="text-[19px] font-bold tracking-tight hidden sm:block">NeuraTube</span>
+    <span class="text-[19px] font-bold tracking-tight hidden sm:block">NeuraStream</span>
   </button>
 
   <form id="main-form" class="flex-1 max-w-2xl mx-auto hidden sm:flex items-center">
@@ -1359,14 +1404,6 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
     <div class="sb-item" data-nav="chats"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0-7.6 13.8L3 21l4.4-1.4A9 9 0 1 0 12 3Zm-4 8h8v1.5H8V11Zm0-3h8v1.5H8V8Z"/></svg>Chats</div>
     <div class="sb-item" data-nav="history"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 8.66 11.5l-1.9-.6A7 7 0 1 1 12 5c1.9 0 3.6.76 4.86 2H14v2h7V2h-2v3.35A8.96 8.96 0 0 0 12 3Zm-1 5v5l4.25 2.52.75-1.23-3.5-2.07V8H11Z"/></svg>History</div>
     <div class="sb-item" data-nav="liked"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M18.77 11h-4.23l1.52-4.94A1.54 1.54 0 0 0 14.6 4h-.2a1.54 1.54 0 0 0-1.34.77L8.92 12H6V4H4v16h14a2 2 0 0 0 1.95-1.55l1.66-6A2 2 0 0 0 19.6 11h-.83ZM6 18v-4h3.42l.6-1L13.19 6l-1.42 4.62-.6 2A1.5 1.5 0 0 0 12.62 15h5.13l-1.44 3H6Z"/></svg>Liked videos</div>
-    <hr class="my-2 border-0 h-px" style="background:var(--line)">
-    <div class="sb-title">Platforms</div>
-    <div class="sb-item" data-platform="youtube"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#ff0000"><path d="M23 12s0-3.85-.5-5.7a2.9 2.9 0 0 0-2-2C18.6 3.8 12 3.8 12 3.8s-6.6 0-8.5.5a2.9 2.9 0 0 0-2 2C1 8.15 1 12 1 12s0 3.85.5 5.7a2.9 2.9 0 0 0 2 2c1.9.5 8.5.5 8.5.5s6.6 0 8.5-.5a2.9 2.9 0 0 0 2-2c.5-1.85.5-5.7.5-5.7ZM9.75 15.5v-7L15.5 12l-5.75 3.5Z"/></svg>YouTube</div>
-    <div class="sb-item" data-platform="instagram"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#e1306c"><path d="M12 2.16c3.2 0 3.58.01 4.85.07 1.17.05 1.96.24 2.42.4.6.24 1.04.52 1.5.98.46.46.74.9.98 1.5.16.46.35 1.25.4 2.42.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.05 1.17-.24 1.96-.4 2.42a4 4 0 0 1-.98 1.5c-.46.46-.9.74-1.5.98-.46.16-1.25.35-2.42.4-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-1.17-.05-1.96-.24-2.42-.4a4 4 0 0 1-1.5-.98 4 4 0 0 1-.98-1.5c-.16-.46-.35-1.25-.4-2.42-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85c.05-1.17.24-1.96.4-2.42.24-.6.52-1.04.98-1.5.46-.46.9-.74 1.5-.98.46-.16 1.25-.35 2.42-.4C8.42 2.17 8.8 2.16 12 2.16Zm0 5.68a4.16 4.16 0 1 0 0 8.32 4.16 4.16 0 0 0 0-8.32Zm0 6.86a2.7 2.7 0 1 1 0-5.4 2.7 2.7 0 0 1 0 5.4Zm5.3-7.03a.97.97 0 1 1-1.94 0 .97.97 0 0 1 1.94 0Z"/></svg>Instagram</div>
-    <div class="sb-item" data-platform="facebook"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#1877f2"><path d="M22 12a10 10 0 1 0-11.56 9.88v-6.99H7.9V12h2.54V9.8c0-2.5 1.5-3.89 3.78-3.89 1.09 0 2.24.2 2.24.2v2.46H15.2c-1.24 0-1.63.77-1.63 1.56V12h2.78l-.44 2.89h-2.34v6.99A10 10 0 0 0 22 12Z"/></svg>Facebook</div>
-    <div class="sb-item" data-platform="x"><svg class="w-5 h-5 mx-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M18.9 2H22l-6.77 7.74L23.2 22h-6.24l-4.9-6.4L6.5 22H3.34l7.24-8.28L2.8 2h6.4l4.43 5.85L18.9 2Zm-1.1 18.1h1.72L7.4 3.8H5.55l12.25 16.3Z"/></svg>X (Twitter)</div>
-    <div class="sb-item" data-platform="telegram"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#26a5e4"><path d="M21.9 4.6 18.9 19c-.23 1-.8 1.25-1.63.78l-4.5-3.32-2.17 2.09c-.24.24-.44.44-.9.44l.33-4.6 8.37-7.56c.36-.32-.08-.5-.57-.18L7.66 13.53l-4.44-1.39c-.96-.3-.98-.96.2-1.42l17.3-6.67c.8-.3 1.5.18 1.18 1.55Z"/></svg>Telegram</div>
-    <div class="sb-item" data-platform="whatsapp"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#25d366"><path d="M12 2a10 10 0 0 0-8.66 15L2 22l5.13-1.34A10 10 0 1 0 12 2Zm5.06 14.06c-.21.6-1.23 1.14-1.7 1.19-.44.05-.98.07-1.57-.11a14 14 0 0 1-5.87-4.05c-1.6-1.85-2.3-3.7-2.3-4.47 0-.77.55-1.63 1.02-2 .3-.24.6-.28.8-.28h.58c.19 0 .44-.03.68.5l.93 2.23c.08.16.13.35.02.56l-.35.53-.5.56c-.16.16-.33.34-.15.66.18.32.8 1.34 1.72 2.18 1.19 1.08 2.2 1.41 2.5 1.57.3.16.48.13.66-.08l.95-1.1c.21-.27.4-.2.66-.1l2.1.99c.26.13.44.19.5.3.07.11.07.64-.13 1.24Z"/></svg>WhatsApp</div>
     <hr class="my-2 border-0 h-px" style="background:var(--line)">
     <div class="sb-title">Explore</div>
     <div class="sb-item" data-explore="trending"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M13.5 1.5s.83 2.83.83 5.15c0 2.22-1.46 4.02-3.68 4.02S6.9 8.87 6.9 6.65c0-.32.02-.64.07-.95C4.53 7.26 3 10.03 3 13.15 3 18.05 7.03 22 12 22s9-3.95 9-8.85c0-5.85-4.24-10.15-7.5-11.65Z"/></svg>Trending</div>
@@ -1479,11 +1516,6 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
 
 <!-- ================= VIEW: SHORTS ================= -->
 <div id="view-shorts" class="view px-2 sm:px-6 py-3">
-  <div class="chip-row mb-3" id="shorts-tabs">
-    <button class="chip-btn on" data-tab="youtube">YouTube Shorts</button>
-    <button class="chip-btn" data-tab="instagram">Instagram Reels</button>
-    <button class="chip-btn" data-tab="facebook">Facebook Reels</button>
-  </div>
   <div class="flex gap-2 mb-4 max-w-xl">
     <input id="shorts-search" placeholder="Search Shorts… (funny, dance, ipl)" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
     <button id="shorts-btn" class="px-5 py-2.5 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">Search</button>
@@ -1498,24 +1530,6 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
   <div class="flex gap-2 mt-4 max-w-xl">
     <input id="reel-url-input" placeholder="Paste any Instagram / Facebook / X / Telegram reel URL…" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
   </div>
-</div>
-
-<!-- ================= VIEW: PLATFORM ================= -->
-<div id="view-platform" class="view px-2 sm:px-6 py-4">
-  <div class="flex items-center gap-3 mb-1">
-    <div id="pf-icon" class="w-11 h-11 rounded-2xl grid place-items-center text-white" style="background:var(--bg2)">?</div>
-    <div>
-      <h2 id="pf-name" class="text-2xl font-bold"></h2>
-      <p id="pf-sub" class="text-xs" style="color:var(--muted)"></p>
-    </div>
-  </div>
-  <div id="pf-note" class="hidden mt-3 rounded-xl p-4 text-sm" style="background:var(--bg2)"></div>
-  <div class="mt-4 flex gap-2 max-w-xl">
-    <input id="pf-url" placeholder="Paste any video link from this platform…" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
-    <button id="pf-play" class="px-5 py-2.5 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">Play</button>
-  </div>
-  <h3 class="font-medium text-sm mt-8 mb-3" style="color:var(--muted)">Trending from this platform (live web)</h3>
-  <div id="pf-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
 </div>
 
 <!-- ================= VIEW: LIKED / MINE ================= -->
@@ -1632,7 +1646,7 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
         <svg class="w-7 h-7" style="color:var(--accent)" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
       </div>
       <p class="text-sm font-semibold" id="drop-title">Drag & drop or click to select</p>
-      <p class="text-xs mt-1" style="color:var(--muted)">MP4 / WebM / MKV · up to 200 MB · auto thumbnail</p>
+      <p class="text-xs mt-1" style="color:var(--muted)">MP4 / WebM / MKV · 200 MB local · 500 MB with cloud storage · auto thumbnail</p>
       <video id="thumb-video" class="hidden"></video>
       <img id="thumb-preview" class="hidden w-48 aspect-video object-cover rounded-xl mx-auto mt-4 border" style="border-color:var(--line)">
     </div>
@@ -1654,7 +1668,7 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
 <div id="auth-modal" class="hidden fixed inset-0 z-50 grid place-items-center p-4 bg-black/70 backdrop-blur-sm">
   <div class="rounded-2xl w-full max-w-sm p-6" style="background:var(--bg);border:1px solid var(--line)">
     <div class="flex items-center justify-between mb-1">
-      <h3 class="font-bold text-lg" id="auth-title">Sign in to NeuraTube</h3>
+      <h3 class="font-bold text-lg" id="auth-title">Sign in to NeuraStream</h3>
       <button id="auth-close" class="ctr-btn"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
     </div>
     <p class="text-xs mb-5" style="color:var(--muted)" id="auth-sub">Email par OTP aayega — Gmail bhi chalega.</p>
@@ -1792,6 +1806,8 @@ async function refreshUser() {
     const label = $('auth-zone-label');
     if (currentUser) {
       label.textContent = currentUser.name.split(' ')[0];
+      const av = document.querySelector('#auth-zone-btn svg');
+      if (av) { av.style.color = avatarColor(); }
       if ($('up-uploader')) { $('up-uploader').value = currentUser.name; $('up-uploader').readOnly = true; }
     } else { label.textContent = 'Sign in'; }
   } catch (e) {}
@@ -1924,7 +1940,7 @@ async function openLocal(id) {
     setWatchMeta(v, true);
     const sel = $('quality-select'); sel.innerHTML = '';
     sel.appendChild(new Option('original', 'original'));
-    playSrc('/media/' + v.filename, true);
+    playSrc((v.filename && v.filename.startsWith('http')) ? v.filename : '/media/' + v.filename, true);
     loadComments(v.id);
     $('w-sub').textContent = lsGet('nt-subs', []).includes(v.uploader) ? 'Subscribed' : 'Subscribe';
     loadRelated(v.title, v);
@@ -2072,7 +2088,7 @@ $('w-sub').addEventListener('click', () => {
 });
 $('w-share').addEventListener('click', async () => {
   const url = currentMedia?.webpage_url || location.href;
-  if (navigator.share) { try { await navigator.share({ title: currentMedia?.title || 'NeuraTube', url }); return; } catch(e){} }
+  if (navigator.share) { try { await navigator.share({ title: currentMedia?.title || 'NeuraStream', url }); return; } catch(e){} }
   try { await navigator.clipboard.writeText(url); showError && setStatus('Link copied!'); setTimeout(setStatus, 1500, null); }
   catch (e) { showError('Copy failed: ' + url); }
 });
@@ -2185,7 +2201,7 @@ function buildReel(v) {
   const item = document.createElement('div');
   item.className = 'reel-item relative w-full h-full flex items-center justify-center bg-black';
   item.innerHTML = `
-    <video src="/media/${esc(v.filename)}" class="h-full max-h-full w-auto max-w-full object-contain" loop muted playsinline preload="metadata" ${v.thumb ? `poster="${esc(v.thumb)}"` : ''}></video>
+    <video src="${esc((v.filename && v.filename.startsWith('http')) ? v.filename : '/media/' + v.filename)}" class="h-full max-h-full w-auto max-w-full object-contain" loop muted playsinline preload="metadata" ${v.thumb ? `poster="${esc(v.thumb)}"` : ''}></video>
     <div class="absolute inset-x-0 bottom-0 p-5 pb-6 bg-gradient-to-t from-black/85 via-black/30 to-transparent">
       <div class="max-w-[75%]"><p class="text-sm font-bold">${esc(v.title)}</p>
       <p class="text-xs text-gray-400 mt-0.5">${esc(v.uploader)} · ${fmtViews(v.views)} views</p></div>
@@ -2232,10 +2248,7 @@ async function searchShorts(q) {
   } catch (e) { setStatus(null); showError('Shorts search failed: ' + e.message); }
 }
 $('shorts-search').addEventListener('keydown', e => { if (e.key === 'Enter') $('shorts-btn').click(); });
-$('shorts-btn').addEventListener('click', () => {
-  if (shortsTab === 'youtube') searchShorts($('shorts-search').value);
-  else discoverReels(shortsTab, $('shorts-search').value);
-});
+$('shorts-btn').addEventListener('click', () => searchShorts($('shorts-search').value));
 $('reel-url-input').addEventListener('change', async () => {
   const url = $('reel-url-input').value.trim(); if (!isUrl(url)) return;
   setStatus('Adding reel…');
@@ -2256,51 +2269,6 @@ $('reel-url-input').addEventListener('change', async () => {
 });
 
 /* ================= platform views ================= */
-const PLATFORMS = {
-  youtube:    { name: 'YouTube',   icon: '<path fill="#ff0000" d="M23 12s0-3.85-.5-5.7a2.9 2.9 0 0 0-2-2C18.6 3.8 12 3.8 12 3.8s-6.6 0-8.5.5a2.9 2.9 0 0 0-2 2C1 8.15 1 12 1 12s0 3.85.5 5.7a2.9 2.9 0 0 0 2 2c1.9.5 8.5.5 8.5.5s6.6 0 8.5-.5a2.9 2.9 0 0 0 2-2c.5-1.85.5-5.7.5-5.7ZM9.75 15.5v-7L15.5 12l-5.75 3.5Z"/>', sub: 'Trending, search & ad-free playback via YouTube Data API + yt-dlp', search: 'trending music video' },
-  instagram:  { name: 'Instagram', icon: '<path fill="#e1306c" d="M12 2.16c3.2 0 3.58.01 4.85.07 1.17.05 1.96.24 2.42.4.6.24 1.04.52 1.5.98.46.46.74.9.98 1.5.16.46.35 1.25.4 2.42.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.05 1.17-.24 1.96-.4 2.42a4 4 0 0 1-.98 1.5c-.46.46-.9.74-1.5.98-.46.16-1.25.35-2.42.4-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-1.17-.05-1.96-.24-2.42-.4a4 4 0 0 1-1.5-.98 4 4 0 0 1-.98-1.5c-.16-.46-.35-1.25-.4-2.42-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85c.05-1.17.24-1.96.4-2.42.24-.6.52-1.04.98-1.5.46-.46.9-.74 1.5-.98.46-.16 1.25-.35 2.42-.4C8.42 2.17 8.8 2.16 12 2.16Zm0 5.68a4.16 4.16 0 1 0 0 8.32 4.16 4.16 0 0 0 0-8.32Zm0 6.86a2.7 2.7 0 1 1 0-5.4 2.7 2.7 0 0 1 0 5.4Z"/>', sub: 'Public Reels — paste link ya web results se play karo', search: 'instagram reels trending' },
-  facebook:   { name: 'Facebook',  icon: '<path fill="#1877f2" d="M22 12a10 10 0 1 0-11.56 9.88v-6.99H7.9V12h2.54V9.8c0-2.5 1.5-3.89 3.78-3.89 1.09 0 2.24.2 2.24.2v2.46H15.2c-1.24 0-1.63.77-1.63 1.56V12h2.78l-.44 2.89h-2.34v6.99A10 10 0 0 0 22 12Z"/>', sub: 'Public videos & Reels', search: 'facebook reels trending' },
-  x:          { name: 'X (Twitter)', icon: '<path fill="currentColor" d="M18.9 2H22l-6.77 7.74L23.2 22h-6.24l-4.9-6.4L6.5 22H3.34l7.24-8.28L2.8 2h6.4l4.43 5.85L18.9 2Z"/>', sub: 'Public videos from X', search: 'twitter viral video' },
-  telegram:   { name: 'Telegram', icon: '<path fill="#26a5e4" d="M21.9 4.6 18.9 19c-.23 1-.8 1.25-1.63.78l-4.5-3.32-2.17 2.09c-.24.24-.44.44-.9.44l.33-4.6 8.37-7.56c.36-.32-.08-.5-.57-.18L7.66 13.53l-4.44-1.39c-.96-.3-.98-.96.2-1.42l17.3-6.67c.8-.3 1.5.18 1.18 1.55Z"/>', sub: 'Public channel videos (t.me links)', search: 'telegram video channel' },
-  whatsapp:   { name: 'WhatsApp',  icon: '<path fill="#25d366" d="M12 2a10 10 0 0 0-8.66 15L2 22l5.13-1.34A10 10 0 1 0 12 2Zm5.06 14.06c-.21.6-1.23 1.14-1.7 1.19-.44.05-.98.07-1.57-.11a14 14 0 0 1-5.87-4.05c-1.6-1.85-2.3-3.7-2.3-4.47 0-.77.55-1.63 1.02-2 .3-.24.6-.28.8-.28h.58c.19 0 .44-.03.68.5l.93 2.23c.08.16.13.35.02.56l-.35.53-.5.56c-.16.16-.33.34-.15.66.18.32.8 1.34 1.72 2.18 1.19 1.08 2.2 1.41 2.5 1.57.3.16.48.13.66-.08l.95-1.1c.21-.27.4-.2.66-.1l2.1.99c.26.13.44.19.5.3.07.11.07.64-.13 1.24Z"/>', sub: 'Statuses E2E-encrypted hain — extract nahi ho sakti', search: 'whatsapp status video', note: 'WhatsApp statuses aur chats end-to-end encrypted hain, isliye koi bhi open extractor unhe access nahi kar sakta. YouTube / Instagram / X / Facebook / Telegram ke public links use karo.' },
-};
-document.querySelectorAll('.sb-item[data-platform]').forEach(it =>
-  it.addEventListener('click', () => openPlatform(it.dataset.platform)));
-
-async function openPlatform(key) {
-  const p = PLATFORMS[key]; if (!p) return;
-  showView('platform');
-  document.querySelectorAll('.sb-item').forEach(x => x.classList.remove('active'));
-  const act = document.querySelector(`.sb-item[data-platform="${key}"]`);
-  if (act) act.classList.add('active');
-  $('pf-name').textContent = p.name;
-  $('pf-sub').textContent = p.sub;
-  $('pf-icon').innerHTML = `<svg viewBox="0 0 24 24" style="width:26px;height:26px">${p.icon}</svg>`;
-  const note = $('pf-note');
-  if (p.note) { note.textContent = p.note; note.classList.remove('hidden'); } else note.classList.add('hidden');
-  const grid = $('pf-grid'); grid.innerHTML = '';
-  $('pf-url').value = '';
-  try {
-    const d = await (await fetch('/api/search?q=' + encodeURIComponent(p.search))).json();
-    (d.results || []).slice(0, 12).forEach(r => {
-      const isVideoish = /youtu\.?be|instagram|fb\.watch|facebook\.com|twitter\.com|x\.com|t\.me/i.test(r.url || '');
-      const card = document.createElement('div');
-      card.className = 'yt-card rounded-xl p-4';
-      card.style.background = 'var(--bg2)';
-      card.innerHTML = `
-        <p class="v-meta text-[10px] uppercase tracking-wider mb-1.5">${esc(r.source || '')}</p>
-        <p class="v-title">${esc(r.title)}</p>
-        <p class="v-meta line-clamp-3 mt-1">${esc(r.body || '')}</p>
-        ${isVideoish ? '<button class="play-here mt-2 px-3 py-1.5 rounded-full text-[11px] font-semibold" style="background:var(--accent);color:#fff">Play here</button>'
-                     : '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="inline-block mt-2 text-[11px] underline">open</a>'}`;
-      if (isVideoish) card.querySelector('.play-here').addEventListener('click', ev => { ev.stopPropagation(); openRemote(r.url, null); });
-      grid.appendChild(card);
-    });
-  } catch (e) {}
-}
-$('pf-play').addEventListener('click', () => { const u = $('pf-url').value.trim(); if (u) openRemote(u, null); });
-$('pf-url').addEventListener('keydown', e => { if (e.key === 'Enter') $('pf-play').click(); });
-
 /* ================= explore ================= */
 document.querySelectorAll('.sb-item[data-explore]').forEach(it =>
   it.addEventListener('click', () => {
@@ -2341,7 +2309,8 @@ dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag
 $('file-input').addEventListener('change', e => { if (e.target.files[0]) pickFile(e.target.files[0]); });
 function pickFile(f) {
   if (!f.type.startsWith('video/')) { showError('Video file choose karo.'); return; }
-  if (f.size > 200 * 1024 * 1024) { showError('200 MB se zyada hai.'); return; }
+  if (f.size > 500 * 1024 * 1024) { showError('500 MB se zyada hai.'); return; }
+  if (f.size > 200 * 1024 * 1024 && !window.__cloud) { showError('Bina cloud storage 200 MB tak hi hota hai (Supabase env vars set karo).'); return; }
   uploadCtx = { file: f, thumb: '', duration: 0 };
   $('drop-title').textContent = f.name + ' (' + (f.size/1048576).toFixed(1) + ' MB)';
   $('up-submit').disabled = false;
@@ -2518,51 +2487,6 @@ $('dm-form').addEventListener('submit', async e => {
 });
 
 /* ================= reels discovery (Instagram/Facebook, no API) ================= */
-let shortsTab = 'youtube';
-document.querySelectorAll('#shorts-tabs .chip-btn').forEach(b => b.addEventListener('click', () => {
-  document.querySelectorAll('#shorts-tabs .chip-btn').forEach(x => x.classList.remove('on'));
-  b.classList.add('on');
-  shortsTab = b.dataset.tab;
-  if (shortsTab !== 'youtube') discoverReels(shortsTab, $('shorts-search').value);
-}));
-
-async function discoverReels(platform, q) {
-  setStatus('Finding ' + platform + ' reels (keyless web search)…');
-  try {
-    const d = await (await fetch('/api/reels/discover?platform=' + platform + '&q=' + encodeURIComponent(q))).json();
-    const items = d.items || [];
-    const grid = $('shorts-grid'); grid.innerHTML = '';
-    if (!items.length) {
-      grid.innerHTML = '<p class="col-span-full text-sm py-4" style="color:var(--muted)">No ' + platform + ' reels found — try another keyword.</p>';
-      setStatus(null); return;
-    }
-    items.forEach(it => {
-      const c = document.createElement('div');
-      c.className = 'yt-card relative rounded-xl overflow-hidden bg-black border';
-      c.style.borderColor = 'var(--line)';
-      c.innerHTML = `
-        <div class="w-full aspect-[9/16] grid place-items-center" style="background:linear-gradient(160deg,#e1306c33,#1877f233)">
-          <svg class="w-10 h-10" style="color:${platform === 'instagram' ? '#e1306c' : '#1877f2'}" fill="currentColor" viewBox="0 0 24 24"><path d="M10 14.65v-5.3L15 12l-5 2.65Z"/></svg>
-        </div>
-        <span class="dur-badge">${platform === 'instagram' ? 'IG' : 'FB'}</span>
-        <div class="absolute inset-x-0 bottom-0 p-2 bg-gradient-to-t from-black/90 to-transparent">
-          <p class="text-[11px] font-bold leading-tight line-clamp-2">${esc(it.title)}</p>
-          <div class="flex gap-2 mt-1.5">
-            <button class="reel-play px-2.5 py-1 rounded-full text-[10px] font-semibold" style="background:var(--accent);color:#fff">Play</button>
-            <a href="${esc(it.url)}" target="_blank" rel="noopener" class="px-2.5 py-1 rounded-full text-[10px] bg-white/15 text-white">open</a>
-          </div>
-        </div>`;
-      c.querySelector('.reel-play').addEventListener('click', ev => {
-        ev.stopPropagation();
-        setStatus('Trying direct stream (' + platform + ')…');
-        openRemote(it.url, { title: it.title, uploader: platform });
-      });
-      grid.appendChild(c);
-    });
-    setStatus(null);
-  } catch (e) { setStatus(null); showError('Reel search failed: ' + e.message); }
-}
-
 /* shorts search: tab-aware (binding above, after Enter handler) */
 
 /* ================= history ================= */
@@ -2572,6 +2496,11 @@ function loadHistory() {
   $('history-empty').classList.toggle('hidden', !!h.length);
   h.forEach(v => grid.appendChild(ytCard({ ...v, kind: 'youtube' })));
 }
+
+async function detectCloud() {
+  try { const d = await (await fetch('/api/storage-mode')).json(); window.__cloud = d.cloud; } catch (e) { window.__cloud = false; }
+}
+detectCloud();
 
 /* ================= boot ================= */
 refreshUser();
@@ -2587,9 +2516,14 @@ async def index():
     return HTMLResponse(FRONTEND)
 
 
+@app.get("/api/storage-mode")
+async def api_storage_mode():
+    return {"cloud": bool(SUPABASE_URL and SUPABASE_KEY), "max_mb": 500 if (SUPABASE_URL and SUPABASE_KEY) else 200}
+
+
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "6.1.0"}
+    return {"status": "ok", "version": "7.0.0"}
 
 
 # --------------------------------------------------------------------------- #
