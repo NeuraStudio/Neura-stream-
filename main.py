@@ -66,7 +66,7 @@ app = FastAPI(
     title="Neura Stream",
     description="Hybrid video platform: uploads, reels, multi-platform extraction, "
     "live web search and an AI co-pilot — zero API keys.",
-    version="5.0.0",
+    version="6.1.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -185,6 +185,13 @@ def init_db() -> None:
                 token_hash TEXT PRIMARY KEY,
                 user_id    INTEGER NOT NULL,
                 expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id  INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                body       TEXT NOT NULL,
+                created_at REAL NOT NULL
             );
             """
         )
@@ -602,7 +609,7 @@ def _browse_sync(query: str, count: int) -> List[Dict[str, Any]]:
 # Optional: YouTube Data API v3 (FREE tier — 10,000 units/day).
 # Get a key at console.cloud.google.com -> enable "YouTube Data API v3" -> Credentials -> API key.
 # If the env var is not set, the app automatically uses the keyless yt-dlp ytsearch engine.
-YOUTUBE_API_KEY = os.getenv("AIzaSyDwbgbzMiLMGRYTvYmEmtH2bHiW2CLqyxw", "").strip()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 _ISO8601_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 
@@ -783,6 +790,29 @@ def _ddg_search_sync(query: str, max_results: int = 10) -> Dict[str, Any]:
                 "message": "No results right now (rate-limited or empty). Try again in a moment."
                 + (f" Detail: {'; '.join(errors)}" if errors else "")}
     return {"query": query, "results": web_results, "news": news_results, "error": None}
+
+
+@app.get("/api/reels/discover")
+async def api_reels_discover(platform: str = Query("instagram"), q: str = Query("", max_length=100)):
+    """Keyless reels discovery: DDG site-filtered search for Instagram/Facebook reel links."""
+    platform = platform.lower() if platform.lower() in ("instagram", "facebook") else "instagram"
+    base_q = q.strip() or ("reels" if platform == "instagram" else "reels")
+    site = "site:instagram.com/reel" if platform == "instagram" else "site:facebook.com/reel"
+    def _sync():
+        with DDGS(timeout=15) as ddgs:
+            return list(ddgs.text(f"{site} {base_q}", region="wt-wt", max_results=24))
+    try:
+        raw = await asyncio.to_thread(_sync)
+    except Exception as exc:
+        return {"platform": platform, "items": [], "error": f"Discovery failed: {str(exc)[:200]}"}
+    items = []
+    for r in raw:
+        url = r.get("href") or r.get("url") or ""
+        if "/reel" not in url and "/reels" not in url and "/watch" not in url:
+            continue
+        items.append({"title": r.get("title") or "Reel", "url": url, "body": (r.get("body") or "")[:200],
+                      "source": platform})
+    return {"platform": platform, "items": items, "error": None}
 
 
 @app.get("/api/search")
@@ -1104,6 +1134,77 @@ def api_verify_otp(payload: OtpVerify, request: Request):
     return response
 
 
+# --------------------------- in-app chat (DMs) ----------------------------- #
+
+@app.get("/api/chat/users")
+def api_chat_users(request: Request):
+    me = _current_user(request)
+    if not me:
+        return {"error": "auth_required", "message": "Sign in to chat."}
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT u.id, u.name, u.email FROM users u WHERE u.id != ? ORDER BY u.id DESC LIMIT 100",
+            (me["id"],),
+        ).fetchall()
+        users = []
+        for r in rows:
+            last = conn.execute(
+                "SELECT body, created_at FROM messages WHERE (sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?) "
+                "ORDER BY id DESC LIMIT 1",
+                (me["id"], r["id"], r["id"], me["id"]),
+            ).fetchone()
+            users.append({
+                "id": r["id"], "name": r["name"], "email": r["email"],
+                "last": last["body"][:60] if last else "Say hi!",
+                "last_at": last["created_at"] if last else 0,
+            })
+    users.sort(key=lambda u: u["last_at"], reverse=True)
+    return {"me": me, "users": users}
+
+
+@app.get("/api/chat/messages")
+def api_chat_messages(with_user: int, request: Request):
+    me = _current_user(request)
+    if not me:
+        return {"error": "auth_required", "message": "Sign in to chat."}
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT m.*, s.name AS sender_name FROM messages m "
+            "JOIN users s ON s.id = m.sender_id "
+            "WHERE (m.sender_id=? AND m.receiver_id=?) OR (m.sender_id=? AND m.receiver_id=?) "
+            "ORDER BY m.id ASC LIMIT 200",
+            (me["id"], with_user, with_user, me["id"]),
+        ).fetchall()
+    return {"messages": [
+        {"id": r["id"], "mine": r["sender_id"] == me["id"], "body": r["body"],
+         "created_at": r["created_at"], "sender": r["sender_name"]}
+        for r in rows
+    ]}
+
+
+class MessageIn(BaseModel):
+    to: int
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+@app.post("/api/chat/send")
+def api_chat_send(payload: MessageIn, request: Request):
+    me = _current_user(request)
+    if not me:
+        return {"error": "auth_required", "message": "Sign in to chat."}
+    if payload.to == me["id"]:
+        return {"error": "bad_target", "message": "Can't message yourself."}
+    with _db() as conn:
+        target = conn.execute("SELECT 1 FROM users WHERE id = ?", (payload.to,)).fetchone()
+        if not target:
+            return {"error": "not_found", "message": "That user doesn't exist."}
+        conn.execute(
+            "INSERT INTO messages (sender_id, receiver_id, body, created_at) VALUES (?, ?, ?, ?)",
+            (me["id"], payload.to, payload.body.strip(), time.time()),
+        )
+    return {"ok": True}
+
+
 @app.get("/api/auth/me")
 def api_auth_me(request: Request):
     return {"user": _current_user(request)}
@@ -1173,6 +1274,17 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
 @keyframes fadeUp{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}
 .view{display:none}
 .view.active{display:block}
+/* mobile bottom nav */
+#bottom-nav{display:flex}
+@media(min-width:1024px){#bottom-nav{display:none}}
+.bn-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:8px 0;font-size:10px;color:var(--muted);cursor:pointer}
+.bn-item.active{color:var(--fg)}
+.bn-item svg{width:22px;height:22px}
+/* chat bubbles */
+.bubble{max-width:75%;padding:8px 12px;border-radius:12px;font-size:14px;line-height:1.4;position:relative;word-break:break-word}
+.bubble.me{align-self:flex-end;background:#005c4b;color:#fff;border-bottom-right-radius:2px}
+.bubble.them{align-self:flex-start;background:var(--bg2);color:var(--fg);border-bottom-left-radius:2px}
+.bubble .btime{display:block;font-size:10px;opacity:.7;margin-top:3px;text-align:right}
 .skeleton{position:relative;overflow:hidden;background:var(--bg2);border-radius:.75rem}
 .skeleton::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);animation:shimmer 1.5s infinite}
 @keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
@@ -1244,6 +1356,8 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
   <div id="sb-full">
     <div class="sb-item active" data-nav="home"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3 4 9v12h5v-7h6v7h5V9l-8-6Z"/></svg>Home</div>
     <div class="sb-item" data-nav="shorts"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M10 14.65v-5.3L15 12l-5 2.65Zm7.77-4.33-1.2-.5L18 9.06c1.84-.96 2.53-3.23 1.5-5.06s-3.42-2.45-5.26-1.49L6 6.94c-1.88.98-2.57 3.4-1.46 5.24.3.53.72.96 1.23 1.27l1.2.5L5.99 15c-1.84.96-2.53 3.23-1.5 5.06s3.42 2.45 5.26 1.49L18 17.06c1.88-.98 2.57-3.4 1.46-5.24a3.4 3.4 0 0 0-1.23-1.27Z"/></svg>Shorts</div>
+    <div class="sb-item" data-nav="chats"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0-7.6 13.8L3 21l4.4-1.4A9 9 0 1 0 12 3Zm-4 8h8v1.5H8V11Zm0-3h8v1.5H8V8Z"/></svg>Chats</div>
+    <div class="sb-item" data-nav="history"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 8.66 11.5l-1.9-.6A7 7 0 1 1 12 5c1.9 0 3.6.76 4.86 2H14v2h7V2h-2v3.35A8.96 8.96 0 0 0 12 3Zm-1 5v5l4.25 2.52.75-1.23-3.5-2.07V8H11Z"/></svg>History</div>
     <div class="sb-item" data-nav="liked"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M18.77 11h-4.23l1.52-4.94A1.54 1.54 0 0 0 14.6 4h-.2a1.54 1.54 0 0 0-1.34.77L8.92 12H6V4H4v16h14a2 2 0 0 0 1.95-1.55l1.66-6A2 2 0 0 0 19.6 11h-.83ZM6 18v-4h3.42l.6-1L13.19 6l-1.42 4.62-.6 2A1.5 1.5 0 0 0 12.62 15h5.13l-1.44 3H6Z"/></svg>Liked videos</div>
     <hr class="my-2 border-0 h-px" style="background:var(--line)">
     <div class="sb-title">Platforms</div>
@@ -1265,7 +1379,7 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
 <aside id="sidebar-m" class="fixed left-0 top-14 bottom-0 w-60 overflow-y-auto z-40 px-1 py-2 hidden" style="background:var(--bg)"></aside>
 <div id="sb-backdrop" class="hidden fixed inset-0 top-14 z-30 bg-black/50"></div>
 
-<main id="main" class="pt-14 lg:pl-60 transition-all">
+<main id="main" class="pt-14 pb-16 lg:pb-0 lg:pl-60 transition-all">
 <!-- ================= VIEW: HOME ================= -->
 <div id="view-home" class="view active px-2 sm:px-6 py-3">
   <div class="chip-row sticky top-14 z-20 py-2" style="background:var(--bg)" id="home-chips">
@@ -1290,6 +1404,10 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
     <div class="min-w-0">
       <div class="rounded-xl overflow-hidden bg-black relative group select-none" id="player-shell">
         <video id="video" class="w-full aspect-video max-h-[75vh] bg-black" playsinline preload="metadata"></video>
+        <div id="iframe-wrap" class="hidden w-full aspect-video max-h-[75vh] bg-black">
+          <iframe id="yt-frame" class="w-full h-full" src="" title="player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+        </div>
+        <div id="embed-note" class="hidden absolute top-2 left-2 right-2 z-10 rounded-lg px-3 py-2 text-xs" style="background:rgba(0,0,0,.75);color:#fde047"></div>
         <button id="big-play" class="absolute inset-0 grid place-items-center opacity-0 group-hover:opacity-100 transition">
           <span class="w-20 h-20 rounded-full grid place-items-center" style="background:rgba(0,0,0,.55)">
             <svg class="w-10 h-10 ml-1" viewBox="0 0 24 24" fill="#fff"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
@@ -1361,6 +1479,11 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
 
 <!-- ================= VIEW: SHORTS ================= -->
 <div id="view-shorts" class="view px-2 sm:px-6 py-3">
+  <div class="chip-row mb-3" id="shorts-tabs">
+    <button class="chip-btn on" data-tab="youtube">YouTube Shorts</button>
+    <button class="chip-btn" data-tab="instagram">Instagram Reels</button>
+    <button class="chip-btn" data-tab="facebook">Facebook Reels</button>
+  </div>
   <div class="flex gap-2 mb-4 max-w-xl">
     <input id="shorts-search" placeholder="Search Shorts… (funny, dance, ipl)" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
     <button id="shorts-btn" class="px-5 py-2.5 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">Search</button>
@@ -1409,7 +1532,52 @@ input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;bord
   <div id="mine-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
   <p id="mine-empty" class="hidden text-center text-sm py-12" style="color:var(--muted)">You haven't uploaded anything yet.</p>
 </div>
+
+<!-- ================= VIEW: CHATS (WhatsApp-style) ================= -->
+<div id="view-chats" class="view px-2 sm:px-6 py-3">
+  <div class="grid grid-cols-1 md:grid-cols-[320px_minmax(0,1fr)] gap-4 max-w-5xl mx-auto h-[calc(100vh-7rem)]">
+    <div class="rounded-2xl overflow-hidden flex flex-col" style="background:var(--bg2)">
+      <div class="px-4 py-3 font-medium text-sm border-b flex items-center gap-2" style="border-color:var(--line)">
+        <svg class="w-5 h-5" style="color:#25d366" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0-8.66 13.8L3 21l4.4-1.4A9 9 0 1 0 12 3Z"/></svg>
+        Neura Chats <span id="chat-me-name" class="ml-auto text-xs font-normal" style="color:var(--muted)"></span>
+      </div>
+      <div id="chat-users" class="flex-1 overflow-y-auto">
+        <p class="p-6 text-center text-xs" style="color:var(--muted)">Loading users…</p>
+      </div>
+    </div>
+    <div class="rounded-2xl overflow-hidden flex flex-col" style="background:var(--bg2)">
+      <div id="chat-head" class="px-4 py-3 border-b flex items-center gap-3" style="border-color:var(--line)">
+        <div class="ch-avatar" id="chat-peer-avatar" style="width:38px;height:38px;background:#25d366">?</div>
+        <div><p id="chat-peer-name" class="font-medium text-sm">Pick a chat</p>
+        <p class="text-[11px]" style="color:var(--muted)" id="chat-peer-mail"></p></div>
+      </div>
+      <div id="chat-msgs" class="flex-1 overflow-y-auto p-4 flex flex-col gap-2"></div>
+      <form id="dm-form" class="p-2.5 flex gap-2 border-t" style="border-color:var(--line)">
+        <input id="dm-input" placeholder="Type a message…" class="flex-1 px-4 py-2.5 rounded-full text-sm outline-none border" style="background:var(--bg);border-color:var(--line)" autocomplete="off">
+        <button class="w-10 h-10 rounded-full grid place-items-center shrink-0" style="background:#25d366" aria-label="Send">
+          <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M21.9 4.6 18.9 19c-.23 1-.8 1.25-1.63.78l-4.5-3.32-2.17 2.09c-.24.24-.44.44-.9.44l.33-4.6 8.37-7.56c.36-.32-.08-.5-.57-.18L7.66 13.53l-4.44-1.39c-.96-.3-.98-.96.2-1.42l17.3-6.67c.8-.3 1.5.18 1.18 1.55Z"/></svg>
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- ================= VIEW: HISTORY ================= -->
+<div id="view-history" class="view px-2 sm:px-6 py-4">
+  <h2 class="text-2xl font-bold mb-4">Watch history</h2>
+  <div id="history-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+  <p id="history-empty" class="hidden text-center text-sm py-12" style="color:var(--muted)">Nothing watched yet.</p>
+</div>
 </main>
+
+<!-- mobile bottom nav -->
+<nav id="bottom-nav" class="fixed bottom-0 inset-x-0 z-40 lg:hidden border-t" style="background:var(--bg);border-color:var(--line);padding-bottom:env(safe-area-inset-bottom)">
+  <div class="bn-item active" data-bnav="home"><svg fill="currentColor" viewBox="0 0 24 24"><path d="M12 3 4 9v12h5v-7h6v7h5V9l-8-6Z"/></svg>Home</div>
+  <div class="bn-item" data-bnav="shorts"><svg fill="currentColor" viewBox="0 0 24 24"><path d="M10 14.65v-5.3L15 12l-5 2.65Zm7.77-4.33c1.84-.96 2.53-3.23 1.5-5.06s-3.42-2.45-5.26-1.49L6 6.94c-1.88.98-2.57 3.4-1.46 5.24.3.53.72.96 1.23 1.27l1.2.5L5.99 15c-1.84.96-2.53 3.23-1.5 5.06s3.42 2.45 5.26 1.49L18 17.06c1.88-.98 2.57-3.4 1.46-5.24a3.4 3.4 0 0 0-1.23-1.27Z"/></svg>Shorts</div>
+  <div class="bn-item" data-bnav="upload"><svg fill="currentColor" viewBox="0 0 24 24"><path d="M14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2Zm3-7H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Zm4 5.5L21 8v8l-3-2.5v-3Z"/></svg>Create</div>
+  <div class="bn-item" data-bnav="chats"><svg fill="currentColor" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0-8.66 13.8L3 21l4.4-1.4A9 9 0 1 0 12 3Z"/></svg>Chats</div>
+  <div class="bn-item" data-bnav="mine"><svg fill="currentColor" viewBox="0 0 24 24"><path d="M12 4a4 4 0 1 1-4 4 4 4 0 0 1 4-4Zm0 10c4.42 0 8 1.79 8 4v2H4v-2c0-2.21 3.58-4 8-4Z"/></svg>You</div>
+</nav>
 
 <!-- ================= STATUS / ERROR ================= -->
 <div class="max-w-6xl mx-auto px-4 space-y-3">
@@ -1543,10 +1711,11 @@ applyTheme(lsGet('nt-theme', 'dark'));
 
 /* ================= router ================= */
 function showView(v) {
-  ['home','watch','shorts','platform','liked','mine'].forEach(x => $('view-'+x).classList.toggle('active', x === v));
+  ['home','watch','shorts','platform','liked','mine','chats','history'].forEach(x => $('view-'+x).classList.toggle('active', x === v));
   document.querySelectorAll('.sb-item').forEach(it => {
     it.classList.toggle('active', it.dataset.nav === v && v !== 'platform');
   });
+  document.querySelectorAll('.bn-item').forEach(it => it.classList.toggle('active', it.dataset.bnav === v));
   if (v === 'home') $('video').pause();
   window.scrollTo({ top: 0 });
   closeSidebarM();
@@ -1555,7 +1724,18 @@ document.querySelectorAll('.sb-item[data-nav]').forEach(it =>
   it.addEventListener('click', () => { showView(it.dataset.nav);
     if (it.dataset.nav === 'mine') loadMine();
     if (it.dataset.nav === 'liked') loadLiked();
-    if (it.dataset.nav === 'shorts') loadReels(); }));
+    if (it.dataset.nav === 'shorts') loadReels();
+    if (it.dataset.nav === 'chats') openChats();
+    if (it.dataset.nav === 'history') loadHistory(); }));
+document.querySelectorAll('.bn-item').forEach(it =>
+  it.addEventListener('click', () => {
+    const v = it.dataset.bnav;
+    if (v === 'upload') { $('upload-modal').classList.remove('hidden'); return; }
+    showView(v);
+    if (v === 'shorts') loadReels();
+    if (v === 'chats') openChats();
+    if (v === 'mine') loadMine();
+  }));
 $('nav-home').addEventListener('click', () => showView('home'));
 
 /* sidebar mobile */
@@ -1735,10 +1915,10 @@ function setWatchMeta(v, isLocal) {
 
 async function openLocal(id) {
   setStatus('Loading video…');
+  showView('watch');
   try {
     const v = await (await fetch('/api/videos/' + id)).json();
     if (v.error) throw new Error(v.message);
-    showView('watch');
     currentMedia = { ...v, isLocal: true, ytId: null };
     currentStreams = [];
     setWatchMeta(v, true);
@@ -1752,12 +1932,50 @@ async function openLocal(id) {
   } catch (e) { setStatus(null); showError(e.message); }
 }
 
+function ytEmbedFallback(url) {
+  const m = url.match(/[?&]v=([\w-]{6,})/) || url.match(/youtu\.be\/([\w-]{6,})/) || url.match(/embed\/([\w-]{6,})/);
+  const ytId = m && m[1];
+  if (!ytId) return false;
+  const video = $('video'); video.pause(); video.removeAttribute('src');
+  $('iframe-wrap').classList.remove('hidden');
+  video.classList.add('hidden');
+  $('embed-note').classList.remove('hidden');
+  $('embed-note').innerHTML = 'Direct stream blocked — playing via YouTube embed. <a class="underline ml-1" href="' + esc(url) + '" target="_blank" rel="noopener">open on YouTube</a>';
+  $('yt-frame').src = 'https://www.youtube-nocookie.com/embed/' + ytId + '?autoplay=1&rel=0';
+  currentStreams = [];
+  const sel = $('quality-select'); sel.innerHTML = '';
+  sel.appendChild(new Option('embed', 'embed'));
+  return true;
+}
+function useNativePlayer() {
+  $('iframe-wrap').classList.add('hidden');
+  $('embed-note').classList.add('hidden');
+  $('video').classList.remove('hidden');
+  $('yt-frame').src = '';
+}
+function recordHistory(v) {
+  try {
+    const h = lsGet('nt-history', []);
+    h.unshift({ title: v.title, uploader: v.uploader, url: v.webpage_url || v.url || '',
+      thumbnail: v.thumbnail, view_count: v.view_count, duration_label: v.duration_label,
+      published_at: '', kind: v.kind || 'youtube' });
+    lsSet('nt-history', h.slice(0, 60));
+  } catch (e) {}
+}
 async function openRemote(url, hint) {
   setStatus('Fetching stream (yt-dlp)…');
+  useNativePlayer();
+  showView('watch');
+  if (hint && hint.title) {
+    $('w-title').textContent = hint.title;
+    $('w-channel').textContent = hint.uploader || 'Loading…';
+    $('w-avatar').textContent = (hint.uploader || 'N')[0].toUpperCase();
+    $('w-views').textContent = hint.view_count != null ? fmtViews(hint.view_count) + ' views' : '';
+    $('w-desc').textContent = 'Loading stream…';
+  }
   try {
     const data = await (await fetch('/api/stream?url=' + encodeURIComponent(url))).json();
     if (data.error) throw new Error(data.message || data.error);
-    showView('watch');
     const ytId = (url.match(/[?&]v=([\w-]{6,})/) || url.match(/youtu\.be\/([\w-]{6,})/) || [])[1] || null;
     currentMedia = { ...data, isLocal: false, ytId, id: ytId ? 'yt:' + ytId : null, likes: 0 };
     currentStreams = (data.streams || []).filter(s => s.progressive);
@@ -1769,13 +1987,44 @@ async function openRemote(url, hint) {
     loadComments(currentMedia.id || data.webpage_url);
     $('w-sub').textContent = lsGet('nt-subs', []).includes(data.uploader) ? 'Subscribed' : 'Subscribe';
     loadRelated(data.title, data);
+    recordHistory(data);
     setStatus(null);
-  } catch (e) { setStatus(null); showError('Playback failed: ' + e.message); }
+  } catch (e) {
+    setStatus(null);
+    if (ytEmbedFallback(url)) {
+      currentMedia = { isLocal: false, ytId: (url.match(/[?&]v=([\w-]{6,})/) || [])[1] || null,
+        id: null, title: hint?.title || 'YouTube video', uploader: hint?.uploader || 'YouTube',
+        description: '', duration_label: '', view_count: hint?.view_count, thumbnail: hint?.thumbnail,
+        streams: [], webpage_url: url };
+      setWatchMeta(currentMedia, false);
+      loadComments(null);
+      loadRelated(hint?.title || 'trending', {});
+      recordHistory({ ...currentMedia, webpage_url: url });
+    } else {
+      showError('Playback failed: ' + e.message);
+    }
+  }
 }
 
 function playSrc(src, reset) {
+  useNativePlayer();
   const v = $('video'); const t = reset ? 0 : v.currentTime;
-  v.src = src; v.currentTime = t; v.play().catch(() => {});
+  v.src = src; v.currentTime = t;
+  v.play().catch(() => {
+    // browser blocked unmuted autoplay -> muted autoplay + unmute hint
+    v.muted = true; syncMute();
+    v.play().catch(() => {});
+    const hint = document.createElement('button');
+    hint.id = 'unmute-hint';
+    hint.className = 'absolute top-3 left-3 z-20 px-3 py-2 rounded-full text-xs font-semibold';
+    hint.style.cssText = 'background:rgba(0,0,0,.8);color:#fff;border:1px solid rgba(255,255,255,.3)';
+    hint.textContent = 'Tap to unmute';
+    hint.addEventListener('click', () => {
+      v.muted = false; syncMute(); hint.remove();
+    });
+    $('player-shell').appendChild(hint);
+    setTimeout(() => hint.remove(), 12000);
+  });
 }
 $('quality-select').addEventListener('change', e => {
   if (!currentMedia || currentMedia.isLocal) return;
@@ -1897,6 +2146,17 @@ $('btn-fs').addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
   else if ($('player-shell').requestFullscreen) $('player-shell').requestFullscreen();
 });
+video.addEventListener('error', () => {
+  const hint = document.getElementById('unmute-hint'); if (hint) hint.remove();
+  const url = currentMedia && currentMedia.webpage_url;
+  if (url && /youtu/.test(url)) {
+    if (ytEmbedFallback(url)) return;
+  }
+  showError('Stream expired or blocked. Try again, or use the source link.');
+});
+video.addEventListener('waiting', () => { if (!$('iframe-wrap') || $('iframe-wrap').classList.contains('hidden')) setStatus('Buffering…'); });
+video.addEventListener('playing', () => setStatus(null));
+
 document.addEventListener('keydown', e => {
   if (['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)) return;
   if (e.code === 'Space') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
@@ -1971,8 +2231,11 @@ async function searchShorts(q) {
     setStatus(null);
   } catch (e) { setStatus(null); showError('Shorts search failed: ' + e.message); }
 }
-$('shorts-btn').addEventListener('click', () => searchShorts($('shorts-search').value));
-$('shorts-search').addEventListener('keydown', e => { if (e.key === 'Enter') searchShorts($('shorts-search').value); });
+$('shorts-search').addEventListener('keydown', e => { if (e.key === 'Enter') $('shorts-btn').click(); });
+$('shorts-btn').addEventListener('click', () => {
+  if (shortsTab === 'youtube') searchShorts($('shorts-search').value);
+  else discoverReels(shortsTab, $('shorts-search').value);
+});
 $('reel-url-input').addEventListener('change', async () => {
   const url = $('reel-url-input').value.trim(); if (!isUrl(url)) return;
   setStatus('Adding reel…');
@@ -2174,6 +2437,142 @@ document.querySelectorAll('.chat-chip').forEach(c => c.addEventListener('click',
   sendChat(q);
 }));
 
+/* ================= in-app chats (WhatsApp-style DMs) ================= */
+let chatPeerId = null, chatPollTimer = null;
+
+async function openChats() {
+  if (!currentUser) { openAuth(); return; }
+  $('chat-me-name').textContent = '@' + currentUser.name.split(' ')[0].toLowerCase();
+  await loadChatUsers();
+  if (chatPollTimer) clearInterval(chatPollTimer);
+  chatPollTimer = setInterval(async () => {
+    if (chatPeerId && $('view-chats').classList.contains('active')) refreshChat();
+  }, 3000);
+}
+
+async function loadChatUsers() {
+  const box = $('chat-users');
+  try {
+    const d = await (await fetch('/api/chat/users')).json();
+    if (d.error) { box.innerHTML = '<p class="p-6 text-center text-xs" style="color:var(--muted)">' + esc(d.message) + '</p>'; return; }
+    box.innerHTML = '';
+    if (!d.users.length) {
+      box.innerHTML = '<p class="p-6 text-center text-xs" style="color:var(--muted)">Koi aur user nahi hai — kisi aur device/browser se sign up karo (doosra email), phir yahan chat kar sakte ho.</p>';
+      return;
+    }
+    d.users.forEach(u => {
+      const el = document.createElement('div');
+      el.className = 'flex items-center gap-3 px-4 py-3 cursor-pointer hover:brightness-125 transition';
+      el.style.borderBottom = '1px solid var(--line)';
+      el.innerHTML = `<div class="ch-avatar" style="width:40px;height:40px;background:${avatarColor()}">${esc(u.name[0].toUpperCase())}</div>
+        <div class="min-w-0 flex-1"><p class="text-sm font-medium truncate">${esc(u.name)}</p>
+        <p class="text-xs truncate" style="color:var(--muted)">${esc(u.last)}</p></div>
+        <span class="text-[10px]" style="color:var(--muted)">${u.last_at ? timeAgo(u.last_at) : ''}</span>`;
+      el.addEventListener('click', () => openConversation(u));
+      box.appendChild(el);
+    });
+  } catch (e) { box.innerHTML = '<p class="p-6 text-center text-xs" style="color:var(--muted)">Load failed: ' + esc(e.message) + '</p>'; }
+}
+
+async function openConversation(u) {
+  chatPeerId = u.id;
+  $('chat-peer-name').textContent = u.name;
+  $('chat-peer-mail').textContent = u.email || '';
+  $('chat-peer-avatar').textContent = u.name[0].toUpperCase();
+  await refreshChat();
+}
+
+async function refreshChat() {
+  if (!chatPeerId) return;
+  try {
+    const d = await (await fetch('/api/chat/messages?with_user=' + chatPeerId)).json();
+    if (d.error) return;
+    const box = $('chat-msgs');
+    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    box.innerHTML = '';
+    (d.messages || []).forEach(m => {
+      const el = document.createElement('div');
+      el.className = 'bubble ' + (m.mine ? 'me' : 'them');
+      el.textContent = m.body;
+      const t = document.createElement('span');
+      t.className = 'btime'; t.textContent = new Date(m.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      el.appendChild(t);
+      box.appendChild(el);
+    });
+    if (stick) box.scrollTop = box.scrollHeight;
+  } catch (e) {}
+}
+
+$('dm-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const body = $('dm-input').value.trim();
+  if (!body || !chatPeerId) return;
+  $('dm-input').value = '';
+  try {
+    const d = await (await fetch('/api/chat/send', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: chatPeerId, body }) })).json();
+    if (d.error) { showError(d.message); return; }
+    refreshChat();
+  } catch (err) { showError('Send failed: ' + err.message); }
+});
+
+/* ================= reels discovery (Instagram/Facebook, no API) ================= */
+let shortsTab = 'youtube';
+document.querySelectorAll('#shorts-tabs .chip-btn').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#shorts-tabs .chip-btn').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  shortsTab = b.dataset.tab;
+  if (shortsTab !== 'youtube') discoverReels(shortsTab, $('shorts-search').value);
+}));
+
+async function discoverReels(platform, q) {
+  setStatus('Finding ' + platform + ' reels (keyless web search)…');
+  try {
+    const d = await (await fetch('/api/reels/discover?platform=' + platform + '&q=' + encodeURIComponent(q))).json();
+    const items = d.items || [];
+    const grid = $('shorts-grid'); grid.innerHTML = '';
+    if (!items.length) {
+      grid.innerHTML = '<p class="col-span-full text-sm py-4" style="color:var(--muted)">No ' + platform + ' reels found — try another keyword.</p>';
+      setStatus(null); return;
+    }
+    items.forEach(it => {
+      const c = document.createElement('div');
+      c.className = 'yt-card relative rounded-xl overflow-hidden bg-black border';
+      c.style.borderColor = 'var(--line)';
+      c.innerHTML = `
+        <div class="w-full aspect-[9/16] grid place-items-center" style="background:linear-gradient(160deg,#e1306c33,#1877f233)">
+          <svg class="w-10 h-10" style="color:${platform === 'instagram' ? '#e1306c' : '#1877f2'}" fill="currentColor" viewBox="0 0 24 24"><path d="M10 14.65v-5.3L15 12l-5 2.65Z"/></svg>
+        </div>
+        <span class="dur-badge">${platform === 'instagram' ? 'IG' : 'FB'}</span>
+        <div class="absolute inset-x-0 bottom-0 p-2 bg-gradient-to-t from-black/90 to-transparent">
+          <p class="text-[11px] font-bold leading-tight line-clamp-2">${esc(it.title)}</p>
+          <div class="flex gap-2 mt-1.5">
+            <button class="reel-play px-2.5 py-1 rounded-full text-[10px] font-semibold" style="background:var(--accent);color:#fff">Play</button>
+            <a href="${esc(it.url)}" target="_blank" rel="noopener" class="px-2.5 py-1 rounded-full text-[10px] bg-white/15 text-white">open</a>
+          </div>
+        </div>`;
+      c.querySelector('.reel-play').addEventListener('click', ev => {
+        ev.stopPropagation();
+        setStatus('Trying direct stream (' + platform + ')…');
+        openRemote(it.url, { title: it.title, uploader: platform });
+      });
+      grid.appendChild(c);
+    });
+    setStatus(null);
+  } catch (e) { setStatus(null); showError('Reel search failed: ' + e.message); }
+}
+
+/* shorts search: tab-aware (binding above, after Enter handler) */
+
+/* ================= history ================= */
+function loadHistory() {
+  const grid = $('history-grid'); grid.innerHTML = '';
+  const h = lsGet('nt-history', []);
+  $('history-empty').classList.toggle('hidden', !!h.length);
+  h.forEach(v => grid.appendChild(ytCard({ ...v, kind: 'youtube' })));
+}
+
 /* ================= boot ================= */
 refreshUser();
 loadFeed('trending');
@@ -2190,7 +2589,7 @@ async def index():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "5.0.0"}
+    return {"status": "ok", "version": "6.1.0"}
 
 
 # --------------------------------------------------------------------------- #
