@@ -24,7 +24,11 @@
  NOTE ON STORAGE (free tier): disk is ephemeral — uploads + SQLite live in the
  app folder and reset on redeploy/restart. Everything else keeps working.
 
- NO API KEYS. NO PAID SERVICES. NO BUILD STEP. ONE FILE.
+ OPTIONAL (free): set YOUTUBE_API_KEY (YouTube Data API v3, free 10k units/day)
+ from console.cloud.google.com and the browse shelves upgrade to the official
+ API with zero code changes. Without it, everything stays 100% keyless.
+
+ NO PAID SERVICES. NO BUILD STEP. ONE FILE.
 ================================================================================
 """
 
@@ -62,7 +66,7 @@ app = FastAPI(
     title="Neura Stream",
     description="Hybrid video platform: uploads, reels, multi-platform extraction, "
     "live web search and an AI co-pilot — zero API keys.",
-    version="4.0.0",
+    version="5.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -261,9 +265,11 @@ class CommentIn(BaseModel):
 @app.post("/api/videos/{vid}/comments")
 def api_add_comment(vid: str, payload: CommentIn, request: Request):
     with _db() as conn:
-        exists = conn.execute("SELECT 1 FROM videos WHERE id = ?", (vid,)).fetchone()
-        if not exists:
-            return {"error": "not_found", "message": "Video not found."}
+        is_external = vid.startswith("yt:")
+        if not is_external:
+            exists = conn.execute("SELECT 1 FROM videos WHERE id = ?", (vid,)).fetchone()
+            if not exists:
+                return {"error": "not_found", "message": "Video not found."}
         conn.execute(
             "INSERT INTO comments (video_id, author, body, created_at) VALUES (?, ?, ?, ?)",
             (vid, (_current_user(request) or {}).get("name") or payload.author.strip() or "Guest",
@@ -593,19 +599,152 @@ def _browse_sync(query: str, count: int) -> List[Dict[str, Any]]:
     return out
 
 
+# Optional: YouTube Data API v3 (FREE tier — 10,000 units/day).
+# Get a key at console.cloud.google.com -> enable "YouTube Data API v3" -> Credentials -> API key.
+# If the env var is not set, the app automatically uses the keyless yt-dlp ytsearch engine.
+YOUTUBE_API_KEY = os.getenv("AIzaSyDwbgbzMiLMGRYTvYmEmtH2bHiW2CLqyxw", "").strip()
+
+_ISO8601_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+
+def _parse_iso_duration(value: str) -> int:
+    m = _ISO8601_DURATION.fullmatch(value or "")
+    if not m:
+        return 0
+    h, mi, sec = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + sec
+
+
+async def _youtube_api_browse(query: str, count: int) -> List[Dict[str, Any]]:
+    """YouTube Data API v3 search (~101 units/call): richer and bot-check-free."""
+    import urllib.parse  # noqa: F401 (httpx handles encoding)
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet", "type": "video", "maxResults": min(count, 50),
+                "q": query, "key": YOUTUBE_API_KEY,
+            },
+        )
+        r.raise_for_status()
+        search_items = [it for it in r.json().get("items", []) if it.get("id", {}).get("videoId")]
+        if not search_items:
+            return []
+        ids = [it["id"]["videoId"] for it in search_items]
+        stats: Dict[str, Dict[str, Any]] = {}
+        try:
+            v = await client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "contentDetails,statistics", "id": ",".join(ids), "key": YOUTUBE_API_KEY},
+            )
+            v.raise_for_status()
+            stats = {it["id"]: it for it in v.json().get("items", [])}
+        except Exception:
+            pass  # durations/views are optional garnish
+        items: List[Dict[str, Any]] = []
+        for it in search_items:
+            vid = it["id"]["videoId"]
+            sn = it.get("snippet", {})
+            st = stats.get(vid, {})
+            duration = _parse_iso_duration((st.get("contentDetails") or {}).get("duration", ""))
+            thumbs = sn.get("thumbnails") or {}
+            thumb = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("medium")
+                     or thumbs.get("default") or {}).get("url")
+            try:
+                views = int((st.get("statistics") or {}).get("viewCount") or 0) or None
+            except (TypeError, ValueError):
+                views = None
+            items.append({
+                "title": sn.get("title") or "Untitled",
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "thumbnail": thumb,
+                "duration": duration,
+                "duration_label": _fmt_duration(duration),
+                "view_count": views,
+                "uploader": sn.get("channelTitle") or "YouTube",
+                "kind": "youtube",
+            })
+        return items
+
+
+@app.get("/api/youtube/trending")
+async def api_yt_trending(region: str = Query("IN", min_length=2, max_length=2), n: int = Query(24, ge=1, le=50)):
+    """YouTube trending feed via the FREE Data API (chart=mostPopular, 1 unit/call).
+    Falls back to keyless ytsearch when no API key is configured."""
+    if YOUTUBE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={
+                        "part": "snippet,statistics,contentDetails", "chart": "mostPopular",
+                        "regionCode": region.upper(), "maxResults": min(n, 50), "key": YOUTUBE_API_KEY,
+                    },
+                )
+                r.raise_for_status()
+                items = []
+                for it in r.json().get("items", []):
+                    dur = _parse_iso_duration((it.get("contentDetails") or {}).get("duration", ""))
+                    sn = it.get("snippet", {})
+                    thumbs = sn.get("thumbnails") or {}
+                    thumb = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("medium")
+                             or thumbs.get("default") or {}).get("url")
+                    try:
+                        views = int((it.get("statistics") or {}).get("viewCount") or 0) or None
+                    except (TypeError, ValueError):
+                        views = None
+                    items.append({
+                        "title": sn.get("title") or "Untitled",
+                        "url": f"https://www.youtube.com/watch?v={it.get('id')}",
+                        "thumbnail": thumb,
+                        "duration": dur, "duration_label": _fmt_duration(dur),
+                        "view_count": views,
+                        "uploader": sn.get("channelTitle") or "YouTube",
+                        "published_at": sn.get("publishedAt") or "",
+                        "kind": "youtube",
+                    })
+                return {"items": items, "engine": "youtube-data-api-v3", "error": None}
+        except Exception as exc:
+            # quota/bad key -> keyless fallback below
+            pass
+    try:
+        items = await asyncio.to_thread(_browse_sync, "trending videos today", n)
+        return {"items": items, "engine": "ytsearch (keyless)", "error": None}
+    except Exception as exc:
+        return {"items": [], "engine": "none", "error": f"Trending failed: {str(exc)[:200]}"}
+
+
 @app.get("/api/browse")
 async def api_browse(q: str = Query(..., min_length=2), n: int = Query(24, ge=1, le=40)):
-    """Prime-style browse rows: YouTube search results, no API keys."""
-    try:
-        items = await asyncio.to_thread(_browse_sync, q, n)
-        return {"query": q, "items": items, "error": None}
-    except yt_dlp.utils.DownloadError as exc:
-        msg = str(exc).replace("ERROR:", "").strip()[:300]
-        if "Sign in to confirm" in msg or "not a bot" in msg:
-            msg = "YouTube is bot-checking this server's IP right now — shelves will fill in when it clears. Try a direct link meanwhile."
-        return {"query": q, "items": [], "error": msg}
-    except Exception as exc:
-        return {"query": q, "items": [], "error": f"Browse failed: {str(exc)[:200]}"}
+    """Prime-style browse rows. Uses the FREE YouTube Data API v3 when
+    YOUTUBE_API_KEY is set, otherwise the keyless yt-dlp ytsearch engine."""
+    engine = "ytsearch (keyless)"
+    items: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+    error_note: Optional[str] = None
+
+    if YOUTUBE_API_KEY:
+        try:
+            items = await _youtube_api_browse(q, n)
+            if items:
+                engine = "youtube-data-api-v3"
+        except Exception as exc:
+            # quota exceeded / bad key -> silently fall back to keyless engine
+            error_note = f"YouTube API unavailable ({str(exc)[:120]}) — using keyless engine."
+    if not items:
+        try:
+            items = await asyncio.to_thread(_browse_sync, q, n)
+            if YOUTUBE_API_KEY and not items and locals().get("error_note"):
+                error = error_note
+        except yt_dlp.utils.DownloadError as exc:
+            msg = str(exc).replace("ERROR:", "").strip()[:300]
+            if "Sign in to confirm" in msg or "not a bot" in msg:
+                msg = ("YouTube is bot-checking this server's IP right now — shelves will fill "
+                       "in when it clears. Try a direct link meanwhile.")
+            error = msg
+        except Exception as exc:
+            error = f"Browse failed: {str(exc)[:200]}"
+    return {"query": q, "items": items, "engine": engine, "error": error}
 
 
 # --------------------------------------------------------------------------- #
@@ -826,6 +965,10 @@ async def api_proxy(url: str, request: Request):
     passthrough = {k: v for k, v in upstream.headers.items()
                    if k.lower() in ("content-type", "content-length", "accept-ranges",
                                     "content-range", "etag", "last-modified")}
+    if request.query_params.get("dl") == "1":
+        ctype = (upstream.headers.get("content-type") or "").lower()
+        name = "neura-audio.mp3" if "audio" in ctype else "neura-video.mp4"
+        passthrough["Content-Disposition"] = f'attachment; filename="{name}"'
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=passthrough)
 
 
@@ -983,478 +1126,478 @@ FRONTEND = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Neura Prime — stream everything</title>
+<title>NeuraTube</title>
+<meta name="description" content="NeuraTube — YouTube-style streaming platform with YouTube content, own uploads, Shorts, reels and AI co-pilot.">
+<meta name="theme-color" content="#0f0f0f">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z' fill='%23ff0033'/%3E%3C/svg%3E">
 <script src="https://cdn.tailwindcss.com"></script>
-<script>
-tailwind.config = { darkMode:'class', theme:{ extend:{
-  fontFamily:{ sans:['Inter','system-ui','sans-serif'] },
-  keyframes:{
-    fadeUp:{ '0%':{opacity:0,transform:'translateY(10px)'},'100%':{opacity:1,transform:'translateY(0)'} },
-    pulseGlow:{ '0%,100%':{opacity:.5},'50%':{opacity:.9} },
-  },
-  animation:{ fadeUp:'fadeUp .45s ease-out both', pulseGlow:'pulseGlow 2.4s ease-in-out infinite' },
-}}}
-</script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-  ::-webkit-scrollbar{width:8px;height:8px}
-  ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:rgba(217,70,239,.25);border-radius:8px}
-  ::-webkit-scrollbar-thumb:hover{background:rgba(217,70,239,.45)}
-  body{background:#050510}
-  .glass{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(18px)}
-  .glow-blob{position:fixed;border-radius:9999px;filter:blur(110px);z-index:-1;pointer-events:none}
-  input[type=range].forge-seek{-webkit-appearance:none;appearance:none;height:5px;border-radius:99px;
-    background:linear-gradient(90deg,#0ea5e9 var(--fill,0%),rgba(255,255,255,.14) var(--fill,0%));cursor:pointer}
-  input[type=range].forge-seek::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:99px;
-    background:#fff;box-shadow:0 0 12px rgba(14,165,233,.9);transition:transform .15s}
-  input[type=range].forge-seek::-webkit-slider-thumb:hover{transform:scale(1.25)}
-  input[type=range].forge-seek::-moz-range-thumb{width:14px;height:14px;border:none;border-radius:99px;background:#fff;box-shadow:0 0 12px rgba(14,165,233,.9)}
-  .msg-in{animation:fadeUp .3s ease-out both}
-  .chip{transition:all .18s}
-  .chip:hover{transform:translateY(-1px);background:rgba(14,165,233,.15);border-color:rgba(14,165,233,.4)}
-  .no-scrollbar::-webkit-scrollbar{display:none}
-  .view{display:none}
-  .view.active{display:block}
-  .reel-track{scroll-snap-type:y mandatory;-ms-overflow-style:none;scrollbar-width:none}
-  .reel-track::-webkit-scrollbar{display:none}
-  .reel-item{scroll-snap-align:start;scroll-snap-stop:always}
-  .tab-btn.active{background:rgba(14,165,233,.18);color:#7dd3fc;border-color:rgba(14,165,233,.5)}
-  .drop-zone.drag{border-color:#0ea5e9;background:rgba(14,165,233,.1)}
-  .line-clamp-1{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
-  .line-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-  .line-clamp-3{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-  /* Prime-style hero */
-  #hero{background-size:cover;background-position:center 20%}
-  .hero-fade-b{background:linear-gradient(to top,#050510 5%,rgba(5,5,16,.65) 40%,transparent 90%)}
-  .hero-fade-l{background:linear-gradient(to right,rgba(5,5,16,.92) 0%,rgba(5,5,16,.55) 38%,transparent 75%)}
-  /* shelf */
-  .shelf{scroll-behavior:smooth}
-  .shelf::-webkit-scrollbar{display:none}
-  .poster{transition:transform .25s ease, box-shadow .25s ease}
-  .poster:hover{transform:scale(1.07);box-shadow:0 18px 50px -12px rgba(14,165,233,.45);z-index:10}
-  .poster .ph-over{opacity:0;transition:opacity .2s}
-  .poster:hover .ph-over{opacity:1}
-  .nav-solid{background:rgba(5,5,16,.92)!important;backdrop-filter:blur(14px);border-color:rgba(255,255,255,.08)!important}
+:root{--bg:#0f0f0f;--bg2:#272727;--fg:#f1f1f1;--muted:#aaa;--accent:#ff0033;--chip:#272727;--line:#303030;--link:#3ea6ff}
+html.light{--bg:#ffffff;--bg2:#f2f2f2;--fg:#0f0f0f;--muted:#606060;--accent:#ff0033;--chip:#f2f2f2;--line:#e5e5e5}
+*{-webkit-tap-highlight-color:transparent}
+body{background:var(--bg);color:var(--fg);font-family:Roboto,Arial,sans-serif}
+::selection{background:rgba(255,0,51,.3)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+::-webkit-scrollbar-track{background:transparent}
+a{color:var(--link)}
+.sb-item{display:flex;align-items:center;gap:1.5rem;padding:.55rem .75rem;border-radius:.65rem;cursor:pointer;font-size:14px;color:var(--fg);transition:background .15s}
+.sb-item:hover{background:var(--bg2)}
+.sb-item.active{background:var(--bg2);font-weight:500}
+.sb-title{padding:.5rem .75rem;font-size:14px;font-weight:500;color:var(--fg)}
+.chip-row{display:flex;gap:.55rem;overflow-x:auto;padding-bottom:.25rem}
+.chip-row::-webkit-scrollbar{display:none}
+.chip-btn{white-space:nowrap;padding:.4rem .8rem;border-radius:9999px;background:var(--chip);color:var(--fg);font-size:13.5px;font-weight:500;cursor:pointer;border:1px solid transparent;transition:all .15s}
+.chip-btn:hover{background:var(--line)}
+.chip-btn.on{background:var(--fg);color:var(--bg)}
+.yt-card{cursor:pointer}
+.yt-card .thumb{border-radius:.75rem;overflow:hidden;position:relative}
+.yt-card .thumb img{width:100%;aspect-ratio:16/9;object-fit:cover;background:var(--bg2);transition:transform .3s}
+.yt-card:hover .thumb img{transform:scale(1.03)}
+.dur-badge{position:absolute;bottom:.4rem;right:.4rem;background:rgba(0,0,0,.8);color:#fff;font-size:11.5px;font-weight:500;padding:.1rem .3rem;border-radius:.25rem}
+.v-title{font-size:14.5px;font-weight:500;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:.25rem}
+.v-meta{font-size:12.5px;color:var(--muted)}
+.ch-avatar{width:36px;height:36px;border-radius:9999px;display:grid;place-items:center;font-weight:700;color:#fff;font-size:14px;flex-shrink:0}
+.rail{width:72px}
+.rail .sb-item{flex-direction:column;gap:.35rem;font-size:10px;padding:.9rem 0}
+input[type=range].seek{-webkit-appearance:none;appearance:none;height:4px;border-radius:99px;background:linear-gradient(90deg,var(--accent) var(--fill,0%),rgba(255,255,255,.25) var(--fill,0%));cursor:pointer}
+input[type=range].seek::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:99px;background:#f00}
+input[type=range].seek::-moz-range-thumb{width:13px;height:13px;border:none;border-radius:999px;background:#f00}
+.ctr-btn{padding:.45rem;border-radius:9999px;cursor:pointer;transition:background .15s}
+.ctr-btn:hover{background:rgba(255,255,255,.12)}
+.act-pill{display:inline-flex;align-items:center;gap:.5rem;padding:.5rem .9rem;border-radius:9999px;background:var(--bg2);font-size:13.5px;font-weight:500;cursor:pointer;transition:filter .15s}
+.act-pill:hover{filter:brightness(1.2)}
+.msg-in{animation:fadeUp .3s ease-out both}
+@keyframes fadeUp{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}
+.view{display:none}
+.view.active{display:block}
+.skeleton{position:relative;overflow:hidden;background:var(--bg2);border-radius:.75rem}
+.skeleton::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);animation:shimmer 1.5s infinite}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+.reel-track{scroll-snap-type:y mandatory;-ms-overflow-style:none;scrollbar-width:none}
+.reel-track::-webkit-scrollbar{display:none}
+.reel-item{scroll-snap-align:start;scroll-snap-stop:always}
+.drop-zone.drag{border-color:var(--accent);background:rgba(255,0,51,.08)}
+.line-clamp-1{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.line-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.line-clamp-3{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px;border-radius:8px}
 </style>
 </head>
-<body class="text-gray-100 font-sans min-h-screen antialiased">
+<body class="min-h-screen">
 
-<div class="glow-blob w-[38rem] h-[38rem] bg-sky-600/15 -top-40 -left-40 animate-pulseGlow"></div>
-<div class="glow-blob w-[30rem] h-[30rem] bg-fuchsia-600/15 top-1/3 -right-40 animate-pulseGlow" style="animation-delay:.8s"></div>
+<!-- ================= TOPBAR ================= -->
+<header class="fixed top-0 inset-x-0 h-14 z-50 flex items-center gap-2 px-2 sm:px-4" style="background:var(--bg)">
+  <button id="btn-menu" class="ctr-btn p-2" title="Menu">
+    <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6Zm0 5h18v2H3v-2Zm0 5h18v2H3v-2Z"/></svg>
+  </button>
+  <button id="nav-home" class="flex items-center gap-1 shrink-0 pr-2">
+    <svg class="w-7 h-7" viewBox="0 0 24 24"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z" fill="#ff0033"/></svg>
+    <span class="text-[19px] font-bold tracking-tight hidden sm:block">NeuraTube</span>
+  </button>
 
-<!-- ================= HEADER (transparent -> solid) ================= -->
-<header id="top-nav" class="sticky top-0 z-40 transition-all duration-300" style="background:transparent;border-bottom:1px solid transparent">
-  <div class="max-w-[1700px] mx-auto px-3 sm:px-6 h-16 flex items-center gap-3">
-    <button id="nav-home" class="flex items-center gap-2.5 shrink-0">
-      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center shadow-lg shadow-sky-500/30">
-        <svg style="width:18px;height:18px" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/><rect x="2" y="4" width="3.5" height="16" rx="1.5"/></svg>
-      </div>
-      <div class="leading-tight hidden sm:block">
-        <h1 class="font-extrabold text-lg tracking-tight bg-gradient-to-r from-sky-300 via-white to-fuchsia-400 bg-clip-text text-transparent">neura<span class="text-white">prime</span></h1>
-      </div>
-    </button>
-
-    <nav class="flex items-center gap-1.5 ml-1">
-      <button id="tab-home" class="tab-btn active chip px-3 py-2 rounded-xl border border-white/10 bg-white/5 text-xs font-semibold text-gray-300">Home</button>
-      <button id="tab-reels" class="tab-btn chip px-3 py-2 rounded-xl border border-white/10 bg-white/5 text-xs font-semibold text-gray-300">Reels</button>
-    </nav>
-
-    <form id="main-form" class="flex-1 max-w-xl mx-auto hidden md:flex">
-      <div class="relative w-full">
-        <svg class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-4.35-4.35M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z"/></svg>
-        <input id="main-input" autocomplete="off" placeholder="Search or paste any video link…"
-          class="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/20 outline-none text-sm placeholder-gray-600 transition">
-      </div>
-    </form>
-
-    <div class="flex items-center gap-2 ml-auto">
-      <button id="theme-toggle" class="chip px-2.5 py-2.5 rounded-xl glass" title="Dark / light mode">
-        <svg id="ic-sun" class="w-4 h-4 text-amber-300 hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path stroke-linecap="round" d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-        <svg id="ic-moon" class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
-      </button>
-      <button id="auth-zone-btn" class="chip flex items-center gap-2 px-3 py-2 rounded-xl glass text-xs font-semibold">
-        <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM12 14a7 7 0 0 0-7 7h14a7 7 0 0 0-7-7Z"/></svg>
-        <span id="auth-zone-label">Sign in</span>
-      </button>
-      <button id="btn-upload" class="flex items-center gap-2 px-3.5 py-2 rounded-xl font-semibold text-xs sm:text-sm bg-gradient-to-r from-sky-400 to-sky-500 hover:from-sky-300 hover:to-sky-400 text-slate-900 shadow-lg shadow-sky-500/30 transition-all active:scale-95">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
-        <span class="hidden sm:inline">Upload</span>
-      </button>
-      <button id="chat-toggle" class="chip px-2.5 py-2.5 rounded-xl glass" title="AI Co-pilot">
-        <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h8M8 14h5M21 12a9 9 0 1 1-4.4-7.7L21 3l-1 4.4A8.96 8.96 0 0 1 21 12Z"/></svg>
+  <form id="main-form" class="flex-1 max-w-2xl mx-auto hidden sm:flex items-center">
+    <div class="flex flex-1">
+      <input id="main-input" autocomplete="off" placeholder="Search videos or paste any link"
+        class="flex-1 px-4 py-2 text-sm rounded-l-full border outline-none" style="background:var(--bg);border-color:var(--line);color:var(--fg)" />
+      <button class="px-5 py-2 rounded-r-full border border-l-0 grid place-items-center" style="background:var(--bg2);border-color:var(--line)" title="Search">
+        <svg class="w-5 h-5" fill="currentColor" style="color:var(--fg)"><path d="M20.87 20.17l-5.59-5.59A6.94 6.94 0 0 0 17 10a7 7 0 1 0-7 7 6.94 6.94 0 0 0 4.58-1.72l5.59 5.59.7-.7ZM10 16a6 6 0 1 1 6-6 6 6 0 0 1-6 6Z"/></svg>
       </button>
     </div>
-  </div>
-  <form id="main-form-m" class="md:hidden px-3 pb-3">
-    <input id="main-input-m" autocomplete="off" placeholder="Search or paste any video link…"
-      class="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
   </form>
-</header>
+  <div class="flex-1 sm:hidden"></div>
 
-<!-- ================= STATUS / ERROR ================= -->
-<div class="max-w-[1700px] mx-auto px-4 sm:px-6 pt-4 space-y-3">
-  <div id="status-bar" class="hidden glass rounded-2xl px-5 py-3.5 text-sm flex items-center gap-3">
-    <svg class="w-5 h-5 text-sky-400 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4Z"/></svg>
-    <span id="status-text" class="text-gray-300">Working…</span>
+  <div class="flex items-center gap-1 shrink-0">
+    <button id="btn-search-m" class="ctr-btn sm:hidden" title="Search">
+      <svg class="w-5 h-5" fill="currentColor"><path d="M20.87 20.17l-5.59-5.59A6.94 6.94 0 0 0 17 10a7 7 0 1 0-7 7 6.94 6.94 0 0 0 4.58-1.72l5.59 5.59.7-.7ZM10 16a6 6 0 1 1 6-6 6 6 0 0 1-6 6Z"/></svg>
+    </button>
+    <button id="btn-theme" class="ctr-btn" title="Dark / light">
+      <svg id="ic-sun" class="w-5 h-5 hidden" fill="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg id="ic-moon" class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+    </button>
+    <button id="btn-copilot" class="ctr-btn" title="AI Co-pilot">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="color:var(--accent)"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z"/></svg>
+    </button>
+    <button id="btn-upload" class="ctr-btn" title="Upload video">
+      <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2Zm3-7H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Zm4 5.5L21 8v8l-3-2.5v-3Z"/></svg>
+    </button>
+    <button id="auth-zone-btn" class="ml-1 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium" style="border:1px solid var(--line)">
+      <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:var(--link)"><path d="M12 4a4 4 0 1 1-4 4 4 4 0 0 1 4-4Zm0 10c4.42 0 8 1.79 8 4v2H4v-2c0-2.21 3.58-4 8-4Z"/></svg>
+      <span id="auth-zone-label" class="hidden sm:block" style="color:var(--link)">Sign in</span>
+    </button>
   </div>
-  <div id="error-bar" class="hidden glass rounded-2xl px-5 py-4 text-sm border-red-500/30 bg-red-500/10 flex items-start gap-3">
-    <svg class="w-5 h-5 text-red-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
-    <span id="error-text" class="text-red-200"></span>
+</header>
+<form id="main-form-m" class="hidden fixed top-14 inset-x-0 z-40 px-3 py-2 sm:hidden" style="background:var(--bg)">
+  <div class="flex">
+    <input id="main-input-m" autocomplete="off" placeholder="Search videos or paste any link"
+      class="flex-1 px-4 py-2 text-sm rounded-l-full border outline-none" style="background:var(--bg);border-color:var(--line);color:var(--fg)">
+    <button class="px-4 rounded-r-full border border-l-0" style="background:var(--bg2);border-color:var(--line)">
+      <svg class="w-5 h-5" fill="currentColor" style="color:var(--fg)"><path d="M20.87 20.17l-5.59-5.59A6.94 6.94 0 0 0 17 10a7 7 0 1 0-7 7 6.94 6.94 0 0 0 4.58-1.72l5.59 5.59.7-.7ZM10 16a6 6 0 1 1 6-6 6 6 0 0 1-6 6Z"/></svg>
+    </button>
+  </div>
+</form>
+
+<!-- ================= SIDEBAR ================= -->
+<aside id="sidebar" class="fixed left-0 top-14 bottom-0 w-60 overflow-y-auto z-40 px-1 py-2 hidden lg:block transition-transform" style="background:var(--bg)">
+  <div id="sb-full">
+    <div class="sb-item active" data-nav="home"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3 4 9v12h5v-7h6v7h5V9l-8-6Z"/></svg>Home</div>
+    <div class="sb-item" data-nav="shorts"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M10 14.65v-5.3L15 12l-5 2.65Zm7.77-4.33-1.2-.5L18 9.06c1.84-.96 2.53-3.23 1.5-5.06s-3.42-2.45-5.26-1.49L6 6.94c-1.88.98-2.57 3.4-1.46 5.24.3.53.72.96 1.23 1.27l1.2.5L5.99 15c-1.84.96-2.53 3.23-1.5 5.06s3.42 2.45 5.26 1.49L18 17.06c1.88-.98 2.57-3.4 1.46-5.24a3.4 3.4 0 0 0-1.23-1.27Z"/></svg>Shorts</div>
+    <div class="sb-item" data-nav="liked"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M18.77 11h-4.23l1.52-4.94A1.54 1.54 0 0 0 14.6 4h-.2a1.54 1.54 0 0 0-1.34.77L8.92 12H6V4H4v16h14a2 2 0 0 0 1.95-1.55l1.66-6A2 2 0 0 0 19.6 11h-.83ZM6 18v-4h3.42l.6-1L13.19 6l-1.42 4.62-.6 2A1.5 1.5 0 0 0 12.62 15h5.13l-1.44 3H6Z"/></svg>Liked videos</div>
+    <hr class="my-2 border-0 h-px" style="background:var(--line)">
+    <div class="sb-title">Platforms</div>
+    <div class="sb-item" data-platform="youtube"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#ff0000"><path d="M23 12s0-3.85-.5-5.7a2.9 2.9 0 0 0-2-2C18.6 3.8 12 3.8 12 3.8s-6.6 0-8.5.5a2.9 2.9 0 0 0-2 2C1 8.15 1 12 1 12s0 3.85.5 5.7a2.9 2.9 0 0 0 2 2c1.9.5 8.5.5 8.5.5s6.6 0 8.5-.5a2.9 2.9 0 0 0 2-2c.5-1.85.5-5.7.5-5.7ZM9.75 15.5v-7L15.5 12l-5.75 3.5Z"/></svg>YouTube</div>
+    <div class="sb-item" data-platform="instagram"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#e1306c"><path d="M12 2.16c3.2 0 3.58.01 4.85.07 1.17.05 1.96.24 2.42.4.6.24 1.04.52 1.5.98.46.46.74.9.98 1.5.16.46.35 1.25.4 2.42.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.05 1.17-.24 1.96-.4 2.42a4 4 0 0 1-.98 1.5c-.46.46-.9.74-1.5.98-.46.16-1.25.35-2.42.4-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-1.17-.05-1.96-.24-2.42-.4a4 4 0 0 1-1.5-.98 4 4 0 0 1-.98-1.5c-.16-.46-.35-1.25-.4-2.42-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85c.05-1.17.24-1.96.4-2.42.24-.6.52-1.04.98-1.5.46-.46.9-.74 1.5-.98.46-.16 1.25-.35 2.42-.4C8.42 2.17 8.8 2.16 12 2.16Zm0 5.68a4.16 4.16 0 1 0 0 8.32 4.16 4.16 0 0 0 0-8.32Zm0 6.86a2.7 2.7 0 1 1 0-5.4 2.7 2.7 0 0 1 0 5.4Zm5.3-7.03a.97.97 0 1 1-1.94 0 .97.97 0 0 1 1.94 0Z"/></svg>Instagram</div>
+    <div class="sb-item" data-platform="facebook"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#1877f2"><path d="M22 12a10 10 0 1 0-11.56 9.88v-6.99H7.9V12h2.54V9.8c0-2.5 1.5-3.89 3.78-3.89 1.09 0 2.24.2 2.24.2v2.46H15.2c-1.24 0-1.63.77-1.63 1.56V12h2.78l-.44 2.89h-2.34v6.99A10 10 0 0 0 22 12Z"/></svg>Facebook</div>
+    <div class="sb-item" data-platform="x"><svg class="w-5 h-5 mx-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M18.9 2H22l-6.77 7.74L23.2 22h-6.24l-4.9-6.4L6.5 22H3.34l7.24-8.28L2.8 2h6.4l4.43 5.85L18.9 2Zm-1.1 18.1h1.72L7.4 3.8H5.55l12.25 16.3Z"/></svg>X (Twitter)</div>
+    <div class="sb-item" data-platform="telegram"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#26a5e4"><path d="M21.9 4.6 18.9 19c-.23 1-.8 1.25-1.63.78l-4.5-3.32-2.17 2.09c-.24.24-.44.44-.9.44l.33-4.6 8.37-7.56c.36-.32-.08-.5-.57-.18L7.66 13.53l-4.44-1.39c-.96-.3-.98-.96.2-1.42l17.3-6.67c.8-.3 1.5.18 1.18 1.55Z"/></svg>Telegram</div>
+    <div class="sb-item" data-platform="whatsapp"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" style="color:#25d366"><path d="M12 2a10 10 0 0 0-8.66 15L2 22l5.13-1.34A10 10 0 1 0 12 2Zm5.06 14.06c-.21.6-1.23 1.14-1.7 1.19-.44.05-.98.07-1.57-.11a14 14 0 0 1-5.87-4.05c-1.6-1.85-2.3-3.7-2.3-4.47 0-.77.55-1.63 1.02-2 .3-.24.6-.28.8-.28h.58c.19 0 .44-.03.68.5l.93 2.23c.08.16.13.35.02.56l-.35.53-.5.56c-.16.16-.33.34-.15.66.18.32.8 1.34 1.72 2.18 1.19 1.08 2.2 1.41 2.5 1.57.3.16.48.13.66-.08l.95-1.1c.21-.27.4-.2.66-.1l2.1.99c.26.13.44.19.5.3.07.11.07.64-.13 1.24Z"/></svg>WhatsApp</div>
+    <hr class="my-2 border-0 h-px" style="background:var(--line)">
+    <div class="sb-title">Explore</div>
+    <div class="sb-item" data-explore="trending"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M13.5 1.5s.83 2.83.83 5.15c0 2.22-1.46 4.02-3.68 4.02S6.9 8.87 6.9 6.65c0-.32.02-.64.07-.95C4.53 7.26 3 10.03 3 13.15 3 18.05 7.03 22 12 22s9-3.95 9-8.85c0-5.85-4.24-10.15-7.5-11.65Z"/></svg>Trending</div>
+    <div class="sb-item" data-explore="music"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"/></svg>Music</div>
+    <div class="sb-item" data-explore="movie"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M22 4H2v16h20V4ZM6 18H4v-2h2v2Zm0-4H4v-2h2v2Zm0-4H4V8h2v2Zm0-4H4V4h2v2Zm10 8h-2v-2h2v2Zm0-4h-2v-2h2v2Zm0-4h-2V4h2v2Zm4 12h-2v-2h2v2Zm0-4h-2v-2h2v2Zm0-4h-2V8h2v2Zm0-4h-2V4h2v2Z"/></svg>Movies</div>
+    <div class="sb-item" data-explore="gaming"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M10 8v6H7.83L12 18.2l4.17-4.2H14V8h-4Zm11-1.5v11A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-11A2.5 2.5 0 0 1 5.5 4h13A2.5 2.5 0 0 1 21 6.5Z"/></svg>Gaming</div>
+    <div class="sb-item" data-nav="mine"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2Zm3-7H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Zm4 5.5L21 8v8l-3-2.5v-3Z"/></svg>Your videos</div>
+  </div>
+</aside>
+<aside id="sidebar-m" class="fixed left-0 top-14 bottom-0 w-60 overflow-y-auto z-40 px-1 py-2 hidden" style="background:var(--bg)"></aside>
+<div id="sb-backdrop" class="hidden fixed inset-0 top-14 z-30 bg-black/50"></div>
+
+<main id="main" class="pt-14 lg:pl-60 transition-all">
+<!-- ================= VIEW: HOME ================= -->
+<div id="view-home" class="view active px-2 sm:px-6 py-3">
+  <div class="chip-row sticky top-14 z-20 py-2" style="background:var(--bg)" id="home-chips">
+    <button class="chip-btn on" data-feed="trending">All</button>
+    <button class="chip-btn" data-feed="music">Music</button>
+    <button class="chip-btn" data-feed="movie">Movies</button>
+    <button class="chip-btn" data-feed="gaming">Gaming</button>
+    <button class="chip-btn" data-feed="live">Live</button>
+    <button class="chip-btn" data-feed="cricket">Cricket</button>
+    <button class="chip-btn" data-feed="comedy">Comedy</button>
+    <button class="chip-btn" data-feed="news">News</button>
+  </div>
+  <div id="feed-title" class="px-1 pb-2 pt-1 text-sm font-medium hidden" style="color:var(--muted)"></div>
+  <div id="feed-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+  <div id="feed-skeleton" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+  <div id="feed-empty" class="hidden text-center py-16 text-sm" style="color:var(--muted)">Nothing here — try another search.</div>
+</div>
+
+<!-- ================= VIEW: WATCH ================= -->
+<div id="view-watch" class="view px-2 sm:px-6 py-4">
+  <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_402px] gap-6 max-w-[1750px] mx-auto">
+    <div class="min-w-0">
+      <div class="rounded-xl overflow-hidden bg-black relative group select-none" id="player-shell">
+        <video id="video" class="w-full aspect-video max-h-[75vh] bg-black" playsinline preload="metadata"></video>
+        <button id="big-play" class="absolute inset-0 grid place-items-center opacity-0 group-hover:opacity-100 transition">
+          <span class="w-20 h-20 rounded-full grid place-items-center" style="background:rgba(0,0,0,.55)">
+            <svg class="w-10 h-10 ml-1" viewBox="0 0 24 24" fill="#fff"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
+          </span>
+        </button>
+        <div class="absolute bottom-0 inset-x-0 px-3 pb-2 pt-10 bg-gradient-to-t from-black/90 via-black/40 to-transparent opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition">
+          <input id="seek" class="seek w-full mb-1.5" type="range" min="0" max="1000" value="0" step="0.1" aria-label="Seek">
+          <div class="flex items-center gap-1 text-white">
+            <button id="btn-play" class="ctr-btn"><svg id="ic-play" class="w-6 h-6" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg><svg id="ic-pause" class="w-6 h-6 hidden" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1.5"/><rect x="14" y="4" width="4" height="16" rx="1.5"/></svg></button>
+            <button id="btn-mute" class="ctr-btn"><svg id="ic-vol" class="w-6 h-6" viewBox="0 0 24 24" fill="currentColor"><path d="M13 4.5v15a1 1 0 0 1-1.64.77L6.8 16.5H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h2.8l4.56-3.77A1 1 0 0 1 13 4.5Z"/><path d="M16 8.5a5 5 0 0 1 0 7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg><svg id="ic-muted" class="w-6 h-6 hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M13 4.5v15a1 1 0 0 1-1.64.77L6.8 16.5H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h2.8l4.56-3.77A1 1 0 0 1 13 4.5Z"/><path d="m16 9 5 6m0-6-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+            <span class="text-xs tabular-nums font-medium ml-1"><span id="t-now">0:00</span> / <span id="t-dur">0:00</span></span>
+            <div class="flex-1"></div>
+            <select id="quality-select" class="bg-white/10 border border-white/20 rounded-lg text-xs px-2 py-1.5 outline-none max-w-[120px]"></select>
+            <button id="btn-pip" class="ctr-btn" title="Picture-in-picture"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="12" width="8" height="6" rx="1" fill="currentColor" stroke="none"/></svg></button>
+            <button id="btn-fs" class="ctr-btn" title="Fullscreen"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m13-5v5a2 2 0 0 1-2 2h-3"/></svg></button>
+          </div>
+        </div>
+      </div>
+
+      <h1 id="w-title" class="text-lg sm:text-xl font-bold leading-snug mt-3"></h1>
+
+      <div class="flex flex-wrap items-center gap-3 mt-3">
+        <div class="flex items-center gap-3 flex-1 min-w-[200px] cursor-pointer">
+          <div class="ch-avatar" id="w-avatar" style="width:40px;height:40px">N</div>
+          <div>
+            <p id="w-channel" class="text-sm font-medium leading-tight"></p>
+            <p id="w-subs" class="text-xs" style="color:var(--muted)"></p>
+          </div>
+          <button id="w-sub" class="ml-2 px-4 py-2 rounded-full text-sm font-medium" style="background:var(--fg);color:var(--bg)">Subscribe</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <div class="flex rounded-full overflow-hidden" style="background:var(--bg2)">
+            <button id="w-like" class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium" title="Like"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M18.77 11h-4.23l1.52-4.94A1.54 1.54 0 0 0 14.6 4h-.2a1.54 1.54 0 0 0-1.34.77L8.92 12H6V4H4v16h14a2 2 0 0 0 1.95-1.55l1.66-6A2 2 0 0 0 19.6 11h-.83ZM6 18v-4h3.42l.6-1L13.19 6l-1.42 4.62-.6 2A1.5 1.5 0 0 0 12.62 15h5.13l-1.44 3H6Z"/></svg><span id="w-likes">Like</span></button>
+            <div class="w-px" style="background:var(--line)"></div>
+            <button id="w-dislike" class="px-4 py-2" title="Dislike"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M5.23 13h4.23l-1.52 4.94A1.54 1.54 0 0 0 9.4 20h.2a1.54 1.54 0 0 0 1.34-.77L15.08 12H18v8h2V4H6a2 2 0 0 0-1.95 1.55l-1.66 6A2 2 0 0 0 4.4 13h.83ZM18 6v4h-3.42l-.6 1L10.81 18l1.42-4.62.6-2A1.5 1.5 0 0 0 11.38 9H6.25l1.44-3H18Z"/></svg></button>
+          </div>
+          <button id="w-share" class="act-pill"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M15 5.63 20.66 12 15 18.37V15h-1c-3.96 0-7.14 1-9.75 3.09 1.84-4.07 5.11-6.4 9.89-7.1l.86-.13V5.63Z"/></svg>Share</button>
+          <button id="w-download" class="act-pill"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M17 18v1H6v-1h11Zm-.5-6.6-.7-.7-3.3 3.28V4h-1v9.98L8.2 10.7l-.7.7 4.5 4.5 4.5-4.5Z"/></svg>Download</button>
+        </div>
+      </div>
+
+      <div class="mt-3 rounded-xl p-3 text-sm" style="background:var(--bg2)">
+        <p id="w-views" class="font-medium"></p>
+        <p id="w-desc" class="mt-1 whitespace-pre-line" style="color:var(--fg)"></p>
+      </div>
+
+      <div class="mt-6">
+        <h3 class="font-bold mb-4"><span id="c-count"></span> Comments</h3>
+        <form id="c-form" class="flex gap-3 mb-6">
+          <div class="ch-avatar" style="width:40px;height:40px" id="c-avatar">Y</div>
+          <div class="flex-1">
+            <input id="c-body" placeholder="Add a comment…" required class="w-full bg-transparent border-b pb-1 text-sm outline-none focus:border-current" style="border-color:var(--line)">
+            <div class="flex justify-end gap-2 mt-2">
+              <input id="c-author" placeholder="name (optional)" class="px-3 py-1.5 rounded-full text-xs outline-none" style="background:var(--bg2)">
+              <button class="px-4 py-1.5 rounded-full text-sm font-medium" style="background:#3ea6ff;color:#fff">Comment</button>
+            </div>
+          </div>
+        </form>
+        <div id="c-list" class="space-y-4"></div>
+      </div>
+    </div>
+
+    <div class="min-w-0">
+      <h3 class="font-medium text-sm mb-3" style="color:var(--muted)">Related videos</h3>
+      <div id="related-list" class="space-y-2"></div>
+    </div>
   </div>
 </div>
 
-<!-- ================= VIEW: HOME (Prime-style) ================= -->
-<main id="view-home" class="view active">
+<!-- ================= VIEW: SHORTS ================= -->
+<div id="view-shorts" class="view px-2 sm:px-6 py-3">
+  <div class="flex gap-2 mb-4 max-w-xl">
+    <input id="shorts-search" placeholder="Search Shorts… (funny, dance, ipl)" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
+    <button id="shorts-btn" class="px-5 py-2.5 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">Search</button>
+  </div>
+  <div id="shorts-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 xl:grid-cols-8 gap-3 mb-6"></div>
+  <div class="flex items-center gap-2 mb-3">
+    <span class="w-1.5 h-1.5 rounded-full" style="background:var(--accent)"></span>
+    <h3 class="font-medium text-sm" style="color:var(--muted)">Community shorts feed (vertical scroll)</h3>
+  </div>
+  <div id="reel-track" class="reel-track rounded-2xl overflow-y-auto h-[75vh] bg-black relative"></div>
+  <p id="reels-empty" class="hidden text-center text-sm py-12" style="color:var(--muted)">No community shorts yet — upload a short video.</p>
+  <div class="flex gap-2 mt-4 max-w-xl">
+    <input id="reel-url-input" placeholder="Paste any Instagram / Facebook / X / Telegram reel URL…" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
+  </div>
+</div>
 
-  <!-- HERO -->
-  <section id="hero" class="relative w-full h-[62vh] min-h-[420px] flex items-end overflow-hidden">
-    <div class="hero-fade-l absolute inset-0"></div>
-    <div class="hero-fade-b absolute inset-0"></div>
-    <div id="hero-content" class="relative z-10 max-w-[1700px] mx-auto w-full px-4 sm:px-8 pb-10 pt-16 max-w-2xl">
-      <div id="hero-kicker" class="text-[11px] font-bold uppercase tracking-[0.2em] text-sky-300 mb-2 flex items-center gap-2">
-        <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 11-14h-7l1-6Z"/></svg> Featured on Neura
-      </div>
-      <h2 id="hero-title" class="text-3xl sm:text-5xl font-extrabold leading-tight mb-3 drop-shadow-2xl">Loading…</h2>
-      <p id="hero-meta" class="text-xs sm:text-sm text-gray-300 mb-6"></p>
-      <div class="flex flex-wrap items-center gap-3">
-        <button id="hero-play" class="flex items-center gap-2.5 px-7 py-3.5 rounded-xl font-bold text-sm bg-white text-slate-900 hover:bg-sky-200 transition shadow-2xl active:scale-95">
-          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
-          Play now
-        </button>
-        <button id="hero-copilot" class="flex items-center gap-2.5 px-6 py-3.5 rounded-xl font-semibold text-sm glass hover:bg-white/10 transition active:scale-95">
-          <svg class="w-5 h-5 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z"/></svg>
-          Ask co-pilot
-        </button>
-      </div>
+<!-- ================= VIEW: PLATFORM ================= -->
+<div id="view-platform" class="view px-2 sm:px-6 py-4">
+  <div class="flex items-center gap-3 mb-1">
+    <div id="pf-icon" class="w-11 h-11 rounded-2xl grid place-items-center text-white" style="background:var(--bg2)">?</div>
+    <div>
+      <h2 id="pf-name" class="text-2xl font-bold"></h2>
+      <p id="pf-sub" class="text-xs" style="color:var(--muted)"></p>
     </div>
-  </section>
+  </div>
+  <div id="pf-note" class="hidden mt-3 rounded-xl p-4 text-sm" style="background:var(--bg2)"></div>
+  <div class="mt-4 flex gap-2 max-w-xl">
+    <input id="pf-url" placeholder="Paste any video link from this platform…" class="flex-1 px-4 py-2.5 rounded-full border text-sm outline-none" style="background:var(--bg);border-color:var(--line)">
+    <button id="pf-play" class="px-5 py-2.5 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">Play</button>
+  </div>
+  <h3 class="font-medium text-sm mt-8 mb-3" style="color:var(--muted)">Trending from this platform (live web)</h3>
+  <div id="pf-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+</div>
 
-  <!-- SHELVES -->
-  <section class="max-w-[1700px] mx-auto px-4 sm:px-6 py-6 space-y-2" id="shelves-root">
-    <div id="browse-notice" class="hidden glass rounded-2xl px-5 py-3 text-xs text-gray-400"></div>
-    <div id="shelf-trending" class="shelf-slot"></div>
-    <div id="shelf-community" class="shelf-slot"></div>
-    <div id="shelf-movies" class="shelf-slot"></div>
-    <div id="shelf-shorts" class="shelf-slot"></div>
-    <div id="shelf-music" class="shelf-slot"></div>
-  </section>
-
-  <!-- discover (web search results) -->
-  <section id="discover-section" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pb-10">
-    <div class="flex items-center justify-between mb-4">
-      <h3 class="font-bold text-sm uppercase tracking-widest text-gray-400 flex items-center gap-2">
-        <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span> <span id="discover-title">Web results</span>
-      </h3>
-    </div>
-    <div id="discover-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
-  </section>
+<!-- ================= VIEW: LIKED / MINE ================= -->
+<div id="view-liked" class="view px-2 sm:px-6 py-4">
+  <h2 class="text-2xl font-bold mb-4">Liked videos</h2>
+  <div id="liked-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+  <p id="liked-empty" class="hidden text-center text-sm py-12" style="color:var(--muted)">No liked videos yet.</p>
+</div>
+<div id="view-mine" class="view px-2 sm:px-6 py-4">
+  <div class="flex items-center justify-between mb-4">
+    <h2 class="text-2xl font-bold">Your videos</h2>
+    <button id="mine-upload-btn" class="px-4 py-2 rounded-full text-sm font-medium" style="background:var(--accent);color:#fff">+ Upload</button>
+  </div>
+  <div id="mine-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-x-4 gap-y-8"></div>
+  <p id="mine-empty" class="hidden text-center text-sm py-12" style="color:var(--muted)">You haven't uploaded anything yet.</p>
+</div>
 </main>
 
-<!-- ================= VIEW: WATCH ================= -->
-<main id="view-watch" class="view max-w-[1700px] mx-auto px-4 sm:px-6 py-6">
-  <button id="btn-back" class="chip mb-4 inline-flex items-center gap-2 text-sm text-gray-400 hover:text-white">
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg> Back to browse
-  </button>
+<!-- ================= STATUS / ERROR ================= -->
+<div class="max-w-6xl mx-auto px-4 space-y-3">
+  <div id="status-bar" class="hidden fixed bottom-4 left-4 z-50 rounded-full px-4 py-2.5 text-sm flex items-center gap-2.5 shadow-2xl" style="background:var(--bg2)">
+    <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" style="color:var(--accent)"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4Z"/></svg>
+    <span id="status-text" style="color:var(--fg)">Working…</span>
+  </div>
+  <div id="error-bar" class="hidden fixed bottom-4 right-4 z-50 max-w-sm rounded-xl px-4 py-3 text-sm shadow-2xl border" style="background:var(--bg2);border-color:rgba(239,68,68,.4);color:var(--fg)">
+    <span id="error-text" style="color:#fca5a5"></span>
+  </div>
+</div>
 
-  <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
-    <div class="min-w-0 space-y-5">
-      <div id="player-card" class="glass rounded-3xl overflow-hidden">
-        <div id="player-shell" class="relative group bg-black select-none">
-          <video id="video" class="w-full aspect-video max-h-[70vh] bg-black" playsinline preload="metadata"></video>
-          <button id="big-play" class="absolute inset-0 grid place-items-center bg-black/20 opacity-0 group-hover:opacity-100 transition">
-            <span class="w-20 h-20 rounded-full bg-sky-400/90 shadow-2xl shadow-sky-500/50 grid place-items-center hover:scale-110 transition">
-              <svg class="w-9 h-9 text-slate-900 ml-1" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
-            </span>
-          </button>
-          <div class="absolute bottom-0 inset-x-0 px-4 pb-3 pt-10 bg-gradient-to-t from-black/85 via-black/40 to-transparent opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition">
-            <input id="seek" class="forge-seek w-full mb-2" type="range" min="0" max="1000" value="0" step="0.1" aria-label="Seek">
-            <div class="flex items-center gap-2 sm:gap-3">
-              <button id="btn-play" class="p-2 rounded-lg hover:bg-white/10 transition" aria-label="Play / pause">
-                <svg id="ic-play" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
-                <svg id="ic-pause" class="w-5 h-5 hidden" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1.5"/><rect x="14" y="4" width="4" height="16" rx="1.5"/></svg>
-              </button>
-              <button id="btn-mute" class="p-2 rounded-lg hover:bg-white/10 transition" aria-label="Mute">
-                <svg id="ic-vol" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M13 4.5v15a1 1 0 0 1-1.64.77L6.8 16.5H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h2.8l4.56-3.77A1 1 0 0 1 13 4.5Z"/><path d="M16 8.5a5 5 0 0 1 0 7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
-                <svg id="ic-muted" class="w-5 h-5 hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M13 4.5v15a1 1 0 0 1-1.64.77L6.8 16.5H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h2.8l4.56-3.77A1 1 0 0 1 13 4.5Z"/><path d="m16 9 5 6m0-6-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-              </button>
-              <input id="volume" class="forge-seek w-20 hidden sm:block" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume">
-              <span class="text-xs text-gray-300 tabular-nums font-medium ml-1"><span id="t-now">0:00</span> / <span id="t-dur">0:00</span></span>
-              <div class="flex-1"></div>
-              <select id="quality-select" class="bg-white/10 border border-white/10 rounded-lg text-xs px-2 py-1.5 outline-none hover:bg-white/15 transition max-w-[130px]"></select>
-              <button id="btn-pip" class="p-2 rounded-lg hover:bg-white/10 transition" aria-label="Picture in picture">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="12" width="8" height="6" rx="1" fill="currentColor" stroke="none"/></svg>
-              </button>
-              <button id="btn-fs" class="p-2 rounded-lg hover:bg-white/10 transition" aria-label="Fullscreen">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m13-5v5a2 2 0 0 1-2 2h-3"/></svg>
-              </button>
-            </div>
-          </div>
-        </div>
-        <div class="p-5">
-          <h3 id="w-title" class="font-bold text-base sm:text-lg leading-snug"></h3>
-          <div class="flex flex-wrap items-center gap-x-4 gap-y-2 mt-2.5 text-xs text-gray-400">
-            <span id="w-meta"></span>
-            <div class="flex-1"></div>
-            <button id="w-like" class="chip inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-pink-300 text-xs font-semibold">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 22V11l5-9a3 3 0 0 1 3 3v4h4.5a2 2 0 0 1 2 2.4l-1.6 8A2 2 0 0 1 18 22H7Z"/><path d="M7 11H4v11h3"/></svg>
-              <span id="w-likes">0</span>
-            </button>
-          </div>
-          <p id="w-desc" class="text-sm text-gray-500 mt-3 leading-relaxed"></p>
-        </div>
-      </div>
-
-      <div class="glass rounded-3xl p-5">
-        <h4 class="font-bold text-sm mb-4 flex items-center gap-2 text-gray-300">
-          <svg class="w-4 h-4 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
-          Comments <span id="c-count" class="text-gray-600 font-normal"></span>
-        </h4>
-        <form id="c-form" class="flex gap-2 mb-4">
-          <input id="c-author" placeholder="Your name (optional)" class="w-36 sm:w-44 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-xs placeholder-gray-600">
-          <input id="c-body" placeholder="Add a comment…" required class="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-xs placeholder-gray-600">
-          <button class="px-4 py-2 rounded-xl bg-sky-400/20 border border-sky-400/30 text-sky-300 text-xs font-semibold hover:bg-sky-400/30 transition">Post</button>
-        </form>
-        <div id="c-list" class="space-y-3"></div>
+<!-- ================= CO-PILOT PANEL ================= -->
+<div id="copilot-panel" class="hidden fixed bottom-4 right-4 z-50 w-[92vw] sm:w-96 h-[70vh] rounded-2xl flex flex-col overflow-hidden shadow-2xl" style="background:var(--bg);border:1px solid var(--line)">
+  <div class="px-4 py-3 flex items-center gap-3 border-b" style="border-color:var(--line)">
+    <div class="w-8 h-8 rounded-full grid place-items-center" style="background:linear-gradient(135deg,#3ea6ff,#ff0033)">
+      <svg class="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2l2.4 5.9L20.3 10l-5.9 2.1L12 18l-2.4-5.9L3.7 10l5.9-2.1L12 2Z"/></svg>
+    </div>
+    <div class="flex-1"><p class="font-medium text-sm">Neura Co-pilot</p><p class="text-[11px]" style="color:var(--muted)">video & web synthesis</p></div>
+    <button id="copilot-close" class="ctr-btn"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 18 18 6M6 6l12 12"/></svg></button>
+  </div>
+  <div id="chat-log" class="flex-1 overflow-y-auto p-3 space-y-3 text-sm">
+    <div class="msg-in flex gap-2.5">
+      <div class="ch-avatar" style="width:28px;height:28px;font-size:11px;background:linear-gradient(135deg,#3ea6ff,#ff0033)">AI</div>
+      <div class="rounded-2xl rounded-tl-sm px-3.5 py-2.5 leading-relaxed max-w-[85%]" style="background:var(--bg2)">
+        Playing something? Ask me to summarize it, or anything about the web.
       </div>
     </div>
-
-    <aside id="chat-panel" class="glass rounded-3xl flex-col overflow-hidden lg:sticky lg:top-24 h-[70vh] lg:h-[calc(100vh-8rem)] hidden lg:flex">
-      <div class="px-5 py-4 border-b border-white/10 flex items-center gap-3">
-        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center shadow-lg shadow-sky-500/20">
-          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15Z"/></svg>
-        </div>
-        <div><h3 class="font-bold text-sm">Co-pilot</h3><p class="text-[11px] text-gray-500">video & live-web synthesis</p></div>
-        <div class="flex-1"></div>
-        <button id="chat-close" class="lg:hidden p-2 rounded-lg hover:bg-white/10"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
-      </div>
-      <div id="chat-log" class="flex-1 overflow-y-auto p-4 space-y-4">
-        <div class="msg-in flex gap-3">
-          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
-          <div class="glass rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-gray-200 leading-relaxed max-w-[85%]">
-            I see what you're watching. Ask me to summarize it, explain a part, or search the wider web.
-          </div>
-        </div>
-      </div>
-      <div class="px-4 pb-2 flex gap-2 overflow-x-auto no-scrollbar">
-        <button class="chat-chip chip shrink-0 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400">Summarize this video</button>
-        <button class="chat-chip chip shrink-0 px-3 py-1.5 rounded-full border border-white/10 bg-white/5 text-xs text-gray-400">Find related videos</button>
-      </div>
-      <form id="chat-form" class="p-3 border-t border-white/10 flex gap-2">
-        <input id="chat-input" autocomplete="off" placeholder="Ask anything…" class="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/20 outline-none text-sm placeholder-gray-600 transition">
-        <button class="px-4 py-3 rounded-xl bg-gradient-to-r from-sky-400 to-fuchsia-500 hover:opacity-90 active:scale-95 transition shadow-lg shadow-fuchsia-500/20" aria-label="Send">
-          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m22 2-7 20-4-9-9-4Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M22 2 11 13"/></svg>
-        </button>
-      </form>
-    </aside>
   </div>
-</main>
-
-<!-- ================= VIEW: REELS ================= -->
-<main id="view-reels" class="view max-w-[1700px] mx-auto px-4 sm:px-6 py-6">
-  <div class="glass rounded-2xl px-4 py-3.5 mb-5 flex flex-col sm:flex-row items-center gap-3">
-    <svg class="w-5 h-5 text-fuchsia-400 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 6l4 5m-4-5v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V6M8 11l4 6 4-6"/></svg>
-    <p class="text-xs text-gray-400 flex-1 text-center sm:text-left">Shorts & reels — YouTube Shorts search se browse karo, ya kisi bhi platform ka reel link paste karo. Community uploads bhi isi feed mein autoplay hote hain.</p>
+  <div class="px-3 pb-1.5 flex gap-2 overflow-x-auto chip-row">
+    <button class="chat-chip chip-btn shrink-0">Summarize this video</button>
+    <button class="chat-chip chip-btn shrink-0">Find related videos</button>
   </div>
-
-  <div class="glass rounded-2xl p-4 mb-5">
-    <div class="flex gap-2 mb-4">
-      <input id="shorts-search" placeholder="Search YouTube Shorts… (e.g. funny, dance, ipl)" class="flex-1 px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-sm placeholder-gray-600">
-      <button id="shorts-btn" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-fuchsia-500 to-fuchsia-600 text-sm font-semibold shadow-lg shadow-fuchsia-500/30 hover:opacity-90 transition">Search</button>
-    </div>
-    <div id="shorts-grid" class="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2.5"></div>
-  </div>
-
-  <div class="flex items-center gap-2 mb-3 px-1">
-    <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
-    <h3 class="font-bold text-sm uppercase tracking-widest text-gray-400">Community reels feed</h3>
-    <span class="text-xs text-gray-600 ml-2">(vertical scroll, autoplay)</span>
-  </div>
-  <div id="reel-track" class="reel-track glass rounded-3xl overflow-y-auto h-[75vh] snap-y relative"></div>
-  <p id="reels-empty" class="hidden text-center text-sm text-gray-500 py-16">No community reels yet — upload a short video and it lands here too.</p>
-
-  <div class="glass rounded-2xl px-4 py-3.5 mt-5 flex flex-col sm:flex-row items-center gap-3">
-    <input id="reel-url-input" placeholder="Paste any Instagram / Facebook / X reel URL to add…" class="w-full sm:w-96 px-3.5 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-fuchsia-500/60 outline-none text-xs placeholder-gray-600">
-  </div>
-</main>
+  <form id="chat-form" class="p-2.5 flex gap-2 border-t" style="border-color:var(--line)">
+    <input id="chat-input" autocomplete="off" placeholder="Ask anything…" class="flex-1 px-4 py-2.5 rounded-full text-sm outline-none border" style="background:var(--bg);border-color:var(--line)">
+    <button class="w-10 h-10 rounded-full grid place-items-center" style="background:var(--accent)" aria-label="Send">
+      <svg class="w-4.5 h-4.5 text-white" style="width:18px;height:18px" fill="none" stroke="#fff" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="m22 2-7 20-4-9-9-4Z"/><path stroke-linecap="round" d="M22 2 11 13"/></svg>
+    </button>
+  </form>
+</div>
 
 <!-- ================= UPLOAD MODAL ================= -->
 <div id="upload-modal" class="hidden fixed inset-0 z-50 grid place-items-center p-4 bg-black/70 backdrop-blur-sm">
-  <div class="glass rounded-3xl w-full max-w-lg p-6 animate-fadeUp max-h-[92vh] overflow-y-auto">
+  <div class="rounded-2xl w-full max-w-lg p-6 max-h-[92vh] overflow-y-auto" style="background:var(--bg);border:1px solid var(--line)">
     <div class="flex items-center justify-between mb-5">
-      <h3 class="font-bold text-lg">Upload a video</h3>
-      <button id="upload-close" class="p-2 rounded-lg hover:bg-white/10"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
+      <h3 class="font-bold text-lg">Upload video</h3>
+      <button id="upload-close" class="ctr-btn"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
     </div>
-
-    <div id="drop-zone" class="drop-zone border-2 border-dashed border-white/15 rounded-2xl p-8 text-center cursor-pointer hover:border-sky-400/50 transition mb-4">
+    <div id="drop-zone" class="drop-zone border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition mb-4" style="border-color:var(--line)">
       <input id="file-input" type="file" accept="video/*" class="hidden">
-      <div class="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-sky-400/20 to-fuchsia-400/20 grid place-items-center mb-3">
-        <svg class="w-7 h-7 text-sky-300" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
+      <div class="w-14 h-14 mx-auto rounded-full grid place-items-center mb-3" style="background:var(--bg2)">
+        <svg class="w-7 h-7" style="color:var(--accent)" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4 4 4M4 17v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/></svg>
       </div>
-      <p class="text-sm text-gray-300 font-semibold" id="drop-title">Drop your video here or click to browse</p>
-      <p class="text-xs text-gray-600 mt-1">MP4 / WebM / MKV · up to 200 MB · poster frame is auto-captured</p>
+      <p class="text-sm font-semibold" id="drop-title">Drag & drop or click to select</p>
+      <p class="text-xs mt-1" style="color:var(--muted)">MP4 / WebM / MKV · up to 200 MB · auto thumbnail</p>
       <video id="thumb-video" class="hidden"></video>
-      <img id="thumb-preview" class="hidden w-48 aspect-video object-cover rounded-xl mx-auto mt-4 border border-white/10">
+      <img id="thumb-preview" class="hidden w-48 aspect-video object-cover rounded-xl mx-auto mt-4 border" style="border-color:var(--line)">
     </div>
-
     <div class="space-y-3">
-      <input id="up-title" placeholder="Title *" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
-      <input id="up-uploader" placeholder="Channel name (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
-      <textarea id="up-desc" rows="2" placeholder="Description (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600 resize-none"></textarea>
+      <input id="up-title" placeholder="Title *" class="w-full px-4 py-3 rounded-xl text-sm outline-none border" style="background:var(--bg);border-color:var(--line)">
+      <input id="up-uploader" placeholder="Channel name (optional)" class="w-full px-4 py-3 rounded-xl text-sm outline-none border" style="background:var(--bg);border-color:var(--line)">
+      <textarea id="up-desc" rows="2" placeholder="Description (optional)" class="w-full px-4 py-3 rounded-xl text-sm outline-none border resize-none" style="background:var(--bg);border-color:var(--line)"></textarea>
     </div>
-
     <div id="up-progress" class="hidden mt-4">
-      <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="up-bar" class="h-full w-0 bg-gradient-to-r from-sky-400 to-fuchsia-400 transition-all"></div></div>
-      <p id="up-pct" class="text-xs text-gray-400 mt-1.5 text-center">0%</p>
+      <div class="h-2 rounded-full overflow-hidden" style="background:var(--bg2)"><div id="up-bar" class="h-full w-0 transition-all" style="background:var(--accent)"></div></div>
+      <p id="up-pct" class="text-xs mt-1.5 text-center" style="color:var(--muted)">0%</p>
     </div>
-
-    <button id="up-submit" class="w-full mt-5 py-3.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-sky-500 text-slate-900 shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>Upload</button>
-    <p class="text-[10px] text-gray-600 text-center mt-3">Free-tier note: storage is ephemeral — uploads reset when the server restarts.</p>
+    <button id="up-submit" class="w-full mt-5 py-3.5 rounded-full font-semibold text-sm disabled:opacity-40" style="background:var(--accent);color:#fff" disabled>Upload</button>
+    <p class="text-[10px] text-center mt-3" style="color:var(--muted)">Free-tier storage is ephemeral — uploads reset on server restart.</p>
   </div>
 </div>
 
-<footer class="max-w-[1700px] mx-auto px-6 py-8 text-center text-[11px] text-gray-600">
-  neura prime · single-file FastAPI · keyless yt-dlp browse + DDG + co-pilot · Render free tier
-</footer>
-
-<!-- ================= LIGHT THEME OVERRIDES ================= -->
-<style>
-  html.light body{background:#eef1f8;color:#0f172a}
-  html.light .glass{background:rgba(255,255,255,.66);border-color:rgba(15,23,42,.09);backdrop-filter:blur(14px)}
-  html.light .text-gray-100{color:#0f172a}
-  html.light .text-gray-200{color:#1e293b}
-  html.light .text-gray-300{color:#334155}
-  html.light .text-gray-400{color:#475569}
-  html.light .text-gray-500{color:#64748b}
-  html.light .text-gray-600{color:#94a3b8}
-  html.light .bg-white\/5{background:rgba(15,23,42,.05)}
-  html.light .bg-white\/10{background:rgba(15,23,42,.08)}
-  html.light .border-white\/10{border-color:rgba(15,23,42,.12)}
-  html.light .border-white\/15{border-color:rgba(15,23,42,.16)}
-  html.light .hero-fade-b{background:linear-gradient(to top,#eef1f8 5%,rgba(238,241,248,.6) 40%,transparent 90%)}
-  html.light .hero-fade-l{background:linear-gradient(to right,rgba(238,241,248,.95) 0%,rgba(238,241,248,.55) 38%,transparent 75%)}
-  html.light .nav-solid{background:rgba(238,241,248,.94)!important;border-color:rgba(15,23,42,.1)!important}
-  html.light #top-nav{border-color:transparent}
-  html.light .drop-zone{background:rgba(255,255,255,.5)}
-  html.light .shelf .poster{background:rgba(15,23,42,.06)}
-</style>
-
-<!-- ================= AUTH MODAL (email OTP) ================= -->
+<!-- ================= AUTH MODAL ================= -->
 <div id="auth-modal" class="hidden fixed inset-0 z-50 grid place-items-center p-4 bg-black/70 backdrop-blur-sm">
-  <div class="glass rounded-3xl w-full max-w-sm p-6 animate-fadeUp">
+  <div class="rounded-2xl w-full max-w-sm p-6" style="background:var(--bg);border:1px solid var(--line)">
     <div class="flex items-center justify-between mb-1">
-      <h3 class="font-bold text-lg" id="auth-title">Sign in to Neura</h3>
-      <button id="auth-close" class="p-2 rounded-lg hover:bg-white/10"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
+      <h3 class="font-bold text-lg" id="auth-title">Sign in to NeuraTube</h3>
+      <button id="auth-close" class="ctr-btn"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 18 18 6M6 6l12 12"/></svg></button>
     </div>
-    <p class="text-xs text-gray-500 mb-5" id="auth-sub">Email par OTP aayega — Gmail bhi chalega.</p>
-
+    <p class="text-xs mb-5" style="color:var(--muted)" id="auth-sub">Email par OTP aayega — Gmail bhi chalega.</p>
     <div id="auth-step-1" class="space-y-3">
-      <input id="auth-email" type="email" autocomplete="email" placeholder="your.name@gmail.com"
-        class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
-      <input id="auth-name" placeholder="Your name (optional)" class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-sm placeholder-gray-600">
-      <button id="auth-send" class="w-full py-3 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-sky-500 text-slate-900 shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition">Send code</button>
+      <input id="auth-email" type="email" autocomplete="email" placeholder="your.name@gmail.com" class="w-full px-4 py-3 rounded-xl text-sm outline-none border" style="background:var(--bg);border-color:var(--line)">
+      <input id="auth-name" placeholder="Your name (optional)" class="w-full px-4 py-3 rounded-xl text-sm outline-none border" style="background:var(--bg);border-color:var(--line)">
+      <button id="auth-send" class="w-full py-3 rounded-full font-semibold text-sm" style="background:var(--fg);color:var(--bg)">Send code</button>
     </div>
-
     <div id="auth-step-2" class="hidden space-y-3">
-      <input id="auth-code" inputmode="numeric" maxlength="6" placeholder="6-digit code"
-        class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-sky-400/60 outline-none text-center text-2xl tracking-[0.5em] font-bold placeholder:text-base placeholder:tracking-normal placeholder:text-sm placeholder-gray-600">
-      <button id="auth-verify" class="w-full py-3 rounded-xl font-semibold text-sm bg-gradient-to-r from-sky-400 to-fuchsia-500 text-white shadow-lg shadow-sky-500/30 hover:opacity-90 active:scale-[.98] transition">Verify & continue</button>
-      <button id="auth-back" class="w-full py-2 text-xs text-gray-500 hover:text-sky-400 transition">&larr; change email</button>
+      <input id="auth-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" class="w-full px-4 py-3 rounded-xl text-center text-2xl tracking-[0.5em] font-bold outline-none border" style="background:var(--bg);border-color:var(--line)">
+      <button id="auth-verify" class="w-full py-3 rounded-full font-semibold text-sm" style="background:#3ea6ff;color:#fff">Verify & continue</button>
+      <button id="auth-back" class="w-full py-2 text-xs" style="color:var(--muted)">&larr; change email</button>
     </div>
-
-    <div id="auth-dev-note" class="hidden mt-4 glass rounded-xl p-3 text-xs text-amber-300 leading-relaxed"></div>
-    <p class="text-[10px] text-gray-600 text-center mt-4">Codes are sent from Neura Studio <no-reply@neurastudio.official.com></p>
+    <div id="auth-dev-note" class="hidden mt-4 rounded-xl p-3 text-xs" style="background:var(--bg2);color:#fbbf24"></div>
   </div>
 </div>
 <script>
 /* ================= state & helpers ================= */
 const $ = (id) => document.getElementById(id);
-let currentMedia = null;
-let currentStreams = [];
-let lastSearchResults = [];
-let reelsObserver = null;
+let currentMedia = null, currentStreams = [], currentUser = null, heroTimer = null;
 let uploadCtx = { file: null, thumb: '', duration: 0 };
-let heroItem = null;
-let currentUser = null;
+let reelsObserver = null;
 
 const isUrl = (s) => /^https?:\/\/\S+\.\S+/i.test(s.trim());
 const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
 const fmtTime = (s) => { if (!isFinite(s) || s < 0) return '0:00'; s = Math.floor(s);
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), x = s%60;
   return h ? h+':'+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0') : m+':'+String(x).padStart(2,'0'); };
-const fmtViews = (n) => n == null ? '' : (n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n));
+const fmtViews = (n) => n == null ? '' : (n >= 1e7 ? (n/1e7).toFixed(1)+'Cr' : n >= 1e5 ? (n/1e5).toFixed(1)+'L' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n));
 const timeAgo = (ts) => { const d = Date.now()/1000 - ts;
-  if (d < 60) return 'just now'; if (d < 3600) return Math.floor(d/60)+'m ago';
-  if (d < 86400) return Math.floor(d/3600)+'h ago'; if (d < 2592000) return Math.floor(d/86400)+'d ago';
-  return Math.floor(d/2592000)+'mo ago'; };
+  if (d < 60) return 'just now'; if (d < 3600) return Math.floor(d/60)+' minutes ago';
+  if (d < 86400) return Math.floor(d/3600)+' hours ago'; if (d < 2592000) return Math.floor(d/86400)+' days ago';
+  if (d < 31536000) return Math.floor(d/2592000)+' months ago'; return Math.floor(d/31536000)+' years ago'; };
+const timeAgoISO = (iso) => { if (!iso) return ''; try { return timeAgo(Date.parse(iso)/1000); } catch(e) { return ''; } };
+const avatarColor = () => { const c = ['#f97316','#22c55e','#3ea6ff','#a855f7','#ec4899','#eab308']; return c[Math.floor(Math.random()*c.length)]; };
 
 function setStatus(msg) { if (!msg) { $('status-bar').classList.add('hidden'); return; }
   $('status-text').textContent = msg; $('status-bar').classList.remove('hidden'); }
 function showError(msg) { $('error-text').textContent = msg; $('error-bar').classList.remove('hidden');
-  setTimeout(() => $('error-bar').classList.add('hidden'), 9000); }
+  setTimeout(() => $('error-bar').classList.add('hidden'), 8000); }
+const lsGet = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch(e) { return d; } };
+const lsSet = (k, v) => localStorage.setItem(k, JSON.stringify(v));
 
-/* ================= theme (dark / light) ================= */
+/* ================= theme ================= */
 function applyTheme(mode) {
   document.documentElement.classList.toggle('light', mode === 'light');
   document.documentElement.classList.toggle('dark', mode !== 'light');
   $('ic-sun').classList.toggle('hidden', mode !== 'light');
   $('ic-moon').classList.toggle('hidden', mode === 'light');
-  localStorage.setItem('neura-theme', mode);
+  lsSet('nt-theme', mode);
 }
-$('theme-toggle').addEventListener('click', () =>
-  applyTheme(localStorage.getItem('neura-theme') === 'light' ? 'dark' : 'light'));
-applyTheme(localStorage.getItem('neura-theme') || 'dark');
+$('btn-theme').addEventListener('click', () => applyTheme(lsGet('nt-theme','dark') === 'light' ? 'dark' : 'light'));
+applyTheme(lsGet('nt-theme', 'dark'));
 
-/* ================= auth (email OTP) ================= */
+/* ================= router ================= */
+function showView(v) {
+  ['home','watch','shorts','platform','liked','mine'].forEach(x => $('view-'+x).classList.toggle('active', x === v));
+  document.querySelectorAll('.sb-item').forEach(it => {
+    it.classList.toggle('active', it.dataset.nav === v && v !== 'platform');
+  });
+  if (v === 'home') $('video').pause();
+  window.scrollTo({ top: 0 });
+  closeSidebarM();
+}
+document.querySelectorAll('.sb-item[data-nav]').forEach(it =>
+  it.addEventListener('click', () => { showView(it.dataset.nav);
+    if (it.dataset.nav === 'mine') loadMine();
+    if (it.dataset.nav === 'liked') loadLiked();
+    if (it.dataset.nav === 'shorts') loadReels(); }));
+$('nav-home').addEventListener('click', () => showView('home'));
+
+/* sidebar mobile */
+function openSidebarM() { $('sidebar-m').classList.remove('hidden'); $('sb-backdrop').classList.remove('hidden'); }
+function closeSidebarM() { $('sidebar-m').classList.add('hidden'); $('sb-backdrop').classList.add('hidden'); }
+if (!$('sidebar-m').innerHTML.trim()) { $('sidebar-m').innerHTML = $('sb-full').innerHTML; }
+$('btn-menu').addEventListener('click', openSidebarM);
+$('sb-backdrop').addEventListener('click', closeSidebarM);
+$('sidebar-m').addEventListener('click', e => { if (e.target.closest('.sb-item')) closeSidebarM(); });
+
+/* ================= auth ================= */
 function openAuth() { $('auth-modal').classList.remove('hidden'); $('auth-step-1').classList.remove('hidden');
   $('auth-step-2').classList.add('hidden'); $('auth-dev-note').classList.add('hidden'); }
-function closeAuth() { $('auth-modal').classList.add('hidden'); }
-$('auth-zone-btn').addEventListener('click', () => {
-  if (currentUser) { showView('watch'); $('chat-panel').classList.remove('hidden'); }
-  else openAuth();
-});
-$('auth-close').addEventListener('click', closeAuth);
-$('auth-modal').addEventListener('click', e => { if (e.target === $('auth-modal')) closeAuth(); });
+$('auth-zone-btn').addEventListener('click', () => currentUser ? openCopilot() : openAuth());
+$('auth-close').addEventListener('click', () => $('auth-modal').classList.add('hidden'));
+$('auth-modal').addEventListener('click', e => { if (e.target === $('auth-modal')) $('auth-modal').classList.add('hidden'); });
 
 async function authSendCode() {
-  const email = $('auth-email').value.trim();
-  if (!email) return;
+  const email = $('auth-email').value.trim(); if (!email) return;
   $('auth-send').disabled = true; $('auth-send').textContent = 'Sending…';
   try {
-    const res = await fetch('/api/auth/request-otp', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email })
-    });
-    const d = await res.json();
+    const d = await (await fetch('/api/auth/request-otp', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) })).json();
     if (d.error) { showError(d.message); return; }
-    $('auth-step-1').classList.add('hidden');
-    $('auth-step-2').classList.remove('hidden');
-    $('auth-sub').textContent = 'Code sent to ' + email + ' — check your inbox (and spam).';
-    if (d.dev_otp) {
-      const note = $('auth-dev-note');
-      note.classList.remove('hidden');
-      note.textContent = 'SMTP not configured on this server, so your code is shown here: ' + d.dev_otp;
-    }
-  } catch (e) { showError('Could not send code: ' + e.message); }
+    $('auth-step-1').classList.add('hidden'); $('auth-step-2').classList.remove('hidden');
+    $('auth-sub').textContent = 'Code sent to ' + email + ' — check inbox & spam.';
+    if (d.dev_otp) { $('auth-dev-note').classList.remove('hidden');
+      $('auth-dev-note').textContent = 'SMTP not configured — your code: ' + d.dev_otp; }
+  } catch (e) { showError('Send failed: ' + e.message); }
   finally { $('auth-send').disabled = false; $('auth-send').textContent = 'Send code'; }
 }
 $('auth-send').addEventListener('click', authSendCode);
 $('auth-email').addEventListener('keydown', e => { if (e.key === 'Enter') authSendCode(); });
-
 async function authVerify() {
-  const email = $('auth-email').value.trim(), code = $('auth-code').value.trim();
-  if (!code) return;
+  const email = $('auth-email').value.trim(), code = $('auth-code').value.trim(); if (!code) return;
   $('auth-verify').disabled = true; $('auth-verify').textContent = 'Verifying…';
   try {
-    const res = await fetch('/api/auth/verify', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, code, name: $('auth-name').value.trim() })
-    });
-    const d = await res.json();
+    const d = await (await fetch('/api/auth/verify', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code, name: $('auth-name').value.trim() }) })).json();
     if (d.error) { showError(d.message); return; }
-    closeAuth();
-    await refreshUser();
+    $('auth-modal').classList.add('hidden'); refreshUser();
   } catch (e) { showError('Verify failed: ' + e.message); }
   finally { $('auth-verify').disabled = false; $('auth-verify').textContent = 'Verify & continue'; }
 }
@@ -1465,245 +1608,264 @@ $('auth-back').addEventListener('click', () => { $('auth-step-1').classList.remo
 
 async function refreshUser() {
   try {
-    const d = await (await fetch('/api/auth/me')).json();
-    currentUser = d.user;
+    currentUser = (await (await fetch('/api/auth/me')).json()).user;
     const label = $('auth-zone-label');
     if (currentUser) {
       label.textContent = currentUser.name.split(' ')[0];
-      label.title = currentUser.email + ' — click to open co-pilot. Double-click to sign out.';
-      if ($('c-author')) { $('c-author').value = currentUser.name; $('c-author').readOnly = true; }
       if ($('up-uploader')) { $('up-uploader').value = currentUser.name; $('up-uploader').readOnly = true; }
-    }
+    } else { label.textContent = 'Sign in'; }
   } catch (e) {}
 }
 $('auth-zone-btn').addEventListener('dblclick', async () => {
   if (!currentUser) return;
-  await fetch('/api/auth/logout', { method: 'POST' });
-  currentUser = null;
+  await fetch('/api/auth/logout', { method: 'POST' }); currentUser = null;
   $('auth-zone-label').textContent = 'Sign in';
-  if ($('c-author')) { $('c-author').value = ''; $('c-author').readOnly = false; }
   if ($('up-uploader')) { $('up-uploader').value = ''; $('up-uploader').readOnly = false; }
 });
 
-/* ================= view router ================= */
-function showView(v) {
-  ['home','watch','reels'].forEach(x => $('view-'+x).classList.toggle('active', x === v));
-  $('tab-home').classList.toggle('active', v === 'home');
-  $('tab-reels').classList.toggle('active', v === 'reels');
-  if (v === 'home') $('video').pause();
-  window.scrollTo({ top: 0 });
-}
-$('tab-home').addEventListener('click', () => showView('home'));
-$('tab-reels').addEventListener('click', () => { showView('reels'); loadReels(); });
-$('nav-home').addEventListener('click', () => showView('home'));
-$('btn-back').addEventListener('click', () => showView('home'));
-window.addEventListener('scroll', () => {
-  $('top-nav').classList.toggle('nav-solid', window.scrollY > 40);
-});
-
-/* ================= search router ================= */
-function handleQuery(v) {
-  v = v.trim(); if (!v) return;
-  $('error-bar').classList.add('hidden');
-  if (isUrl(v)) openRemote(v); else doSearch(v);
-}
-$('main-form').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input').value); $('main-input').value=''; });
-$('main-form-m').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input-m').value); $('main-input-m').value=''; });
-
-/* ================= Prime-style shelves ================= */
-const SHELVES = [
-  { slot: 'shelf-trending',  title: 'Trending now',                q: 'trending videos today', n: 24 },
-  { slot: 'shelf-movies',    title: 'Full movies — free to watch', q: 'full movie',            n: 24 },
-  { slot: 'shelf-shorts',    title: 'Shorts & quick bites',         q: 'youtube shorts',        n: 24 },
-  { slot: 'shelf-music',     title: 'Music videos',                q: 'official music video',   n: 24 },
-];
-
-function posterCard(item) {
+/* ================= cards ================= */
+function ytCard(v) {
   const card = document.createElement('div');
-  card.className = 'poster relative shrink-0 w-44 sm:w-56 aspect-video rounded-xl overflow-hidden cursor-pointer bg-white/5 border border-white/10';
-  const thumb = item.thumbnail
-    ? `<img src="${esc(item.thumbnail)}" class="w-full h-full object-cover" loading="lazy">`
-    : `<div class="w-full h-full bg-gradient-to-br from-sky-500/20 to-fuchsia-500/20"></div>`;
+  card.className = 'yt-card';
+  const color = avatarColor();
+  const meta = [v.uploader, v.view_count != null ? fmtViews(v.view_count) + ' views' : '',
+    v.created_at ? timeAgo(v.created_at) : timeAgoISO(v.published_at)].filter(Boolean).join(' · ');
+  const thumb = v.thumbnail
+    ? `<img src="${esc(v.thumbnail)}" loading="lazy" onerror="this.style.opacity=.15">`
+    : `<div style="width:100%;aspect-ratio:16/9"></div>`;
   card.innerHTML = `
-    ${thumb}
-    <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-black/80 text-[10px] font-semibold tabular-nums">${esc(item.duration_label || '')}</span>
-    <div class="ph-over absolute inset-0 bg-gradient-to-t from-black/90 via-black/30 to-transparent flex flex-col justify-end p-3">
-      <span class="w-10 h-10 rounded-full bg-sky-400 text-slate-900 grid place-items-center mb-2 shadow-lg">
-        <svg class="w-5 h-5 ml-0.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
-      </span>
-      <p class="text-xs font-bold leading-snug line-clamp-2">${esc(item.title)}</p>
-      <p class="text-[10px] text-gray-400 mt-0.5 line-clamp-1">${esc(item.uploader || '')}${item.view_count ? ' · ' + fmtViews(item.view_count) + ' views' : ''}</p>
+    <div class="thumb">${thumb}
+      <span class="dur-badge">${esc(v.duration_label || '')}</span></div>
+    <div class="flex gap-3 mt-3">
+      <div class="ch-avatar" style="background:${color}">${esc((v.uploader||'N')[0].toUpperCase())}</div>
+      <div class="min-w-0 flex-1">
+        <p class="v-title">${esc(v.title)}</p>
+        <p class="v-meta line-clamp-1">${esc(meta)}</p>
+      </div>
     </div>`;
-  card.addEventListener('click', () => item.kind === 'local' ? openLocal(item.id) : openRemote(item.url));
+  card.addEventListener('click', () => v.kind === 'local' ? openLocal(v.id) : openRemote(v.url, v));
   return card;
 }
 
-function buildShelf(slotId, title, items) {
-  const slot = $(slotId);
-  slot.innerHTML = '';
-  if (!items || !items.length) return;
-  const wrap = document.createElement('div');
-  wrap.className = 'mb-6';
-  wrap.innerHTML = `
-    <div class="flex items-center justify-between mb-3 px-1">
-      <h3 class="font-bold text-sm sm:text-base uppercase tracking-widest text-gray-300 flex items-center gap-2">
-        <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span> ${esc(title)}
-      </h3>
-      <div class="flex gap-1.5">
-        <button class="scroll-l p-2 rounded-lg glass hover:bg-white/10 transition"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg></button>
-        <button class="scroll-r p-2 rounded-lg glass hover:bg-white/10 transition"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>
-      </div>
-    </div>
-    <div class="shelf flex gap-3.5 overflow-x-auto pb-2 no-scrollbar"></div>`;
-  const row = wrap.querySelector('.shelf');
-  items.forEach(it => row.appendChild(posterCard(it)));
-  const STEP = 600;
-  wrap.querySelector('.scroll-l').addEventListener('click', () => row.scrollBy({ left: -STEP, behavior: 'smooth' }));
-  wrap.querySelector('.scroll-r').addEventListener('click', () => row.scrollBy({ left: STEP, behavior: 'smooth' }));
-  slot.appendChild(wrap);
+function compactCard(v) {
+  const card = document.createElement('div');
+  card.className = 'yt-card flex gap-2 p-1.5 rounded-xl';
+  card.innerHTML = `
+    <div class="thumb shrink-0 w-40"><img src="${esc(v.thumbnail || '')}" class="w-full aspect-video object-cover rounded-lg" loading="lazy">
+      <span class="dur-badge">${esc(v.duration_label || '')}</span></div>
+    <div class="min-w-0 flex-1 py-0.5">
+      <p class="v-title">${esc(v.title)}</p>
+      <p class="v-meta">${esc(v.uploader || '')}</p>
+      <p class="v-meta">${v.view_count != null ? fmtViews(v.view_count) + ' views' : ''}</p>
+    </div>`;
+  card.addEventListener('click', () => v.kind === 'local' ? openLocal(v.id) : openRemote(v.url, v));
+  return card;
 }
 
-async function browseShelf(cfg) {
-  try {
-    const res = await fetch('/api/browse?q=' + encodeURIComponent(cfg.q) + '&n=' + cfg.n);
-    const data = await res.json();
-    if (data.error) { buildShelf(cfg.slot, cfg.title, []); return null; }
-    buildShelf(cfg.slot, cfg.title, data.items || []);
-    return data.items || [];
-  } catch (e) { return null; }
-}
-
-function renderHero(item) {
-  if (!item) return;
-  heroItem = item;
-  const hero = $('hero');
-  if (item.thumbnail) hero.style.backgroundImage = `url('${item.thumbnail}')`;
-  $('hero-title').textContent = item.title;
-  $('hero-meta').textContent = [item.uploader, item.view_count ? fmtViews(item.view_count) + ' views' : '',
-    item.duration_label ? item.duration_label + ' long' : ''].filter(Boolean).join(' · ');
-}
-$('hero-play').addEventListener('click', () => { if (heroItem) openRemote(heroItem.url); });
-$('hero-copilot').addEventListener('click', () => { showView('watch'); $('chat-panel').classList.remove('hidden'); });
-
-async function loadHome() {
-  setStatus('Filling your shelves — keyless YouTube browse…');
-  const trending = await browseShelf(SHELVES[0]);
-  if (trending && trending.length) renderHero(trending[0]);
-  try {
-    const res = await fetch('/api/videos');
-    const data = await res.json();
-    if (data.videos && data.videos.length) buildShelf('shelf-community', 'Your uploads — community', data.videos);
-  } catch (e) {}
-  await Promise.all(SHELVES.slice(1).map(browseShelf));
-  const anyEmpty = SHELVES.every(s => !$(s.slot).querySelector('.shelf'));
-  if (anyEmpty) {
-    const n = $('browse-notice'); n.classList.remove('hidden');
-    n.textContent = "YouTube shelves are empty right now (bot-check or network hiccup). Search or paste a link directly — playback still works.";
+function showSkeletons() {
+  const sk = $('feed-skeleton'); sk.innerHTML = ''; sk.classList.remove('hidden'); $('feed-grid').innerHTML = '';
+  for (let i = 0; i < 12; i++) {
+    const d = document.createElement('div');
+    d.innerHTML = `<div class="skeleton w-full aspect-video"></div>
+      <div class="flex gap-3 mt-3"><div class="skeleton rounded-full w-9 h-9"></div>
+      <div class="flex-1 space-y-2"><div class="skeleton h-3.5 w-full !rounded"></div><div class="skeleton h-3 w-2/3 !rounded"></div></div></div>`;
+    sk.appendChild(d);
   }
-  setStatus(null);
 }
 
-/* ================= watch: local video ================= */
+/* ================= feed ================= */
+async function loadFeed(kind, q) {
+  showSkeletons();
+  $('feed-empty').classList.add('hidden');
+  try {
+    let items = [];
+    if (kind === 'trending') {
+      const d = await (await fetch('/api/youtube/trending?region=IN&n=32')).json();
+      items = d.items || [];
+    } else {
+      const queries = { music: 'music video', movie: 'full movie', gaming: 'gaming gameplay',
+        live: 'live stream', cricket: 'cricket highlights', comedy: 'comedy video', news: 'news today' };
+      const d = await (await fetch('/api/browse?q=' + encodeURIComponent(queries[kind] || kind) + '&n=32')).json();
+      items = d.items || [];
+    }
+    $('feed-skeleton').classList.add('hidden');
+    const grid = $('feed-grid'); grid.innerHTML = '';
+    if (!items.length) { $('feed-empty').classList.remove('hidden'); return; }
+    items.forEach(v => grid.appendChild(ytCard(v)));
+  } catch (e) { $('feed-skeleton').classList.add('hidden'); $('feed-empty').classList.remove('hidden');
+    showError('Feed load failed: ' + e.message); }
+}
+document.querySelectorAll('#home-chips .chip-btn').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#home-chips .chip-btn').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); loadFeed(b.dataset.feed);
+}));
+
+async function runSearch(q) {
+  showView('home'); showSkeletons();
+  try {
+    const d = await (await fetch('/api/browse?q=' + encodeURIComponent(q) + '&n=32')).json();
+    $('feed-skeleton').classList.add('hidden');
+    const grid = $('feed-grid'); grid.innerHTML = '';
+    const items = d.items || [];
+    if (!items.length) { $('feed-empty').classList.remove('hidden'); return; }
+    $('feed-title').textContent = 'Results for ' + q; $('feed-title').classList.remove('hidden');
+    items.forEach(v => grid.appendChild(ytCard(v)));
+  } catch (e) { $('feed-skeleton').classList.add('hidden'); showError('Search failed: ' + e.message); }
+}
+function handleQuery(v) {
+  v = v.trim(); if (!v) return;
+  if (isUrl(v)) openRemote(v, null); else runSearch(v);
+}
+$('main-form').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input').value); $('main-input').value = ''; });
+$('main-form-m').addEventListener('submit', e => { e.preventDefault(); handleQuery($('main-input-m').value); $('main-input-m').value = ''; });
+$('btn-search-m').addEventListener('click', () => { $('main-form-m').classList.toggle('hidden'); $('main-input-m').focus(); });
+
+/* ================= watch ================= */
+function setWatchMeta(v, isLocal) {
+  $('w-title').textContent = v.title || '';
+  $('w-channel').textContent = v.uploader || v.extractor || 'Neura Creator';
+  $('w-avatar').textContent = (v.uploader || 'N')[0].toUpperCase();
+  $('w-avatar').style.background = avatarColor();
+  $('w-subs').textContent = isLocal ? timeAgo(v.created_at) : (v.extractor ? v.extractor + ' source' : '');
+  $('w-views').textContent = (v.view_count != null ? fmtViews(v.view_count) + ' views' : (isLocal ? v.views + ' views' : '')) +
+    (isLocal ? ' · ' + timeAgo(v.created_at) : (v.duration_label ? ' · ' + v.duration_label : ''));
+  $('w-desc').textContent = (v.description || '').slice(0, 600) || 'No description.';
+  $('w-likes').textContent = isLocal ? (v.likes + ' likes') : 'Like';
+}
+
 async function openLocal(id) {
   setStatus('Loading video…');
   try {
-    const res = await fetch('/api/videos/' + id);
-    const v = await res.json();
+    const v = await (await fetch('/api/videos/' + id)).json();
     if (v.error) throw new Error(v.message);
     showView('watch');
-    currentMedia = { ...v, isLocal: true };
+    currentMedia = { ...v, isLocal: true, ytId: null };
     currentStreams = [];
-    $('w-title').textContent = v.title;
-    $('w-meta').textContent = [v.uploader, fmtViews(v.views) + ' views', timeAgo(v.created_at)].filter(Boolean).join(' · ');
-    $('w-desc').textContent = v.description || '';
-    $('w-likes').textContent = v.likes;
+    setWatchMeta(v, true);
     const sel = $('quality-select'); sel.innerHTML = '';
-    const o = document.createElement('option'); o.textContent = 'original'; o.value = 'original'; sel.appendChild(o);
+    sel.appendChild(new Option('original', 'original'));
     playSrc('/media/' + v.filename, true);
-    loadComments(id);
+    loadComments(v.id);
+    $('w-sub').textContent = lsGet('nt-subs', []).includes(v.uploader) ? 'Subscribed' : 'Subscribe';
+    loadRelated(v.title, v);
     setStatus(null);
   } catch (e) { setStatus(null); showError(e.message); }
 }
 
-/* ================= watch: remote (extracted) video ================= */
-async function openRemote(url) {
-  setStatus('Extracting direct CDN stream (yt-dlp)…');
+async function openRemote(url, hint) {
+  setStatus('Fetching stream (yt-dlp)…');
   try {
-    const res = await fetch('/api/stream?url=' + encodeURIComponent(url));
-    const data = await res.json();
+    const data = await (await fetch('/api/stream?url=' + encodeURIComponent(url))).json();
     if (data.error) throw new Error(data.message || data.error);
     showView('watch');
-    currentMedia = { ...data, isLocal: false, id: null, likes: 0 };
+    const ytId = (url.match(/[?&]v=([\w-]{6,})/) || url.match(/youtu\.be\/([\w-]{6,})/) || [])[1] || null;
+    currentMedia = { ...data, isLocal: false, ytId, id: ytId ? 'yt:' + ytId : null, likes: 0 };
     currentStreams = (data.streams || []).filter(s => s.progressive);
-    $('w-title').textContent = data.title;
-    $('w-meta').textContent = [data.extractor, data.uploader, data.duration_label,
-      data.view_count ? fmtViews(data.view_count) + ' views' : ''].filter(Boolean).join(' · ');
-    $('w-desc').textContent = (data.description || '').slice(0, 400);
-    $('w-likes').textContent = '—';
+    setWatchMeta({ ...data, ...((hint && !data.thumbnail) ? { thumbnail: hint.thumbnail } : {}) }, false);
     const sel = $('quality-select'); sel.innerHTML = '';
-    currentStreams.forEach((s, i) => { const o = document.createElement('option'); o.value = i; o.textContent = s.label; sel.appendChild(o); });
+    currentStreams.forEach((s, i) => sel.appendChild(new Option(s.label, i)));
     const best = currentStreams[0] || data.best;
     if (best) playSrc('/api/proxy?url=' + encodeURIComponent(best.url), true);
+    loadComments(currentMedia.id || data.webpage_url);
+    $('w-sub').textContent = lsGet('nt-subs', []).includes(data.uploader) ? 'Subscribed' : 'Subscribe';
+    loadRelated(data.title, data);
     setStatus(null);
-  } catch (e) { setStatus(null); showError('Stream extraction failed: ' + e.message); }
+  } catch (e) { setStatus(null); showError('Playback failed: ' + e.message); }
 }
 
 function playSrc(src, reset) {
   const v = $('video'); const t = reset ? 0 : v.currentTime;
   v.src = src; v.currentTime = t; v.play().catch(() => {});
 }
-
 $('quality-select').addEventListener('change', e => {
   if (!currentMedia || currentMedia.isLocal) return;
-  const src = currentStreams[+e.target.value];
-  if (src) playSrc('/api/proxy?url=' + encodeURIComponent(src.url), false);
+  const s = currentStreams[+e.target.value];
+  if (s) playSrc('/api/proxy?url=' + encodeURIComponent(s.url), false);
 });
 
-/* ================= likes & comments ================= */
-$('w-like').addEventListener('click', async () => {
-  if (!currentMedia || !currentMedia.isLocal || !currentMedia.id) {
-    showError('Liking is available for community uploads.'); return;
-  }
+async function loadRelated(title, self) {
+  const box = $('related-list'); box.innerHTML = '';
   try {
-    const res = await fetch('/api/videos/' + currentMedia.id + '/like', { method: 'POST' });
-    const d = await res.json();
-    if (d.likes != null) { $('w-likes').textContent = d.likes; currentMedia.likes = d.likes; }
-  } catch (e) { showError('Could not like: ' + e.message); }
-});
-
-async function loadComments(id) {
+    const d = await (await fetch('/api/browse?q=' + encodeURIComponent(title.split(' ').slice(0, 5).join(' ')) + '&n=14')).json();
+    (d.items || []).filter(v => v.url !== (self.url || self.webpage_url)).slice(0, 12).forEach(v => box.appendChild(compactCard(v)));
+  } catch (e) {}
   try {
-    const res = await fetch('/api/videos/' + id + '/comments');
-    const d = await res.json();
-    renderComments(d.comments || []);
-  } catch (e) { renderComments([]); }
+    const mine = await (await fetch('/api/videos')).json();
+    mine.videos.slice(0, 2).forEach(v => { if (v.id !== self.id) box.appendChild(compactCard({ ...v, kind: 'local', url: '' })); });
+  } catch (e) {}
 }
-function renderComments(list) {
-  $('c-count').textContent = list.length ? '(' + list.length + ')' : '';
+
+/* like / dislike / subscribe / share / download */
+function toggleLike() {
+  if (!currentMedia) return;
+  const liked = lsGet('nt-liked', []);
+  if (currentMedia.isLocal && currentMedia.id) {
+    fetch('/api/videos/' + currentMedia.id + '/like', { method: 'POST' })
+      .then(r => r.json()).then(d => { if (d.likes != null) { $('w-likes').textContent = d.likes + ' likes'; currentMedia.likes = d.likes; } })
+      .catch(() => {});
+  } else {
+    const i = liked.findIndex(x => x.title === currentMedia.title);
+    if (i >= 0) { liked.splice(i, 1); $('w-likes').textContent = 'Like'; }
+    else { liked.unshift({ title: currentMedia.title, uploader: currentMedia.uploader, url: currentMedia.webpage_url,
+      thumbnail: currentMedia.thumbnail, view_count: currentMedia.view_count, duration_label: currentMedia.duration_label,
+      published_at: '', kind: 'youtube' }); $('w-likes').textContent = 'Liked ✓'; }
+    lsSet('nt-liked', liked.slice(0, 60));
+  }
+}
+$('w-like').addEventListener('click', toggleLike);
+$('w-dislike').addEventListener('click', () => showError('Noted! (feedback saved locally)'));
+$('w-sub').addEventListener('click', () => {
+  const subs = lsGet('nt-subs', []); const name = currentMedia?.uploader; if (!name) return;
+  const i = subs.indexOf(name);
+  if (i >= 0) { subs.splice(i, 1); $('w-sub').textContent = 'Subscribe'; }
+  else { subs.push(name); $('w-sub').textContent = 'Subscribed'; }
+  lsSet('nt-subs', subs);
+});
+$('w-share').addEventListener('click', async () => {
+  const url = currentMedia?.webpage_url || location.href;
+  if (navigator.share) { try { await navigator.share({ title: currentMedia?.title || 'NeuraTube', url }); return; } catch(e){} }
+  try { await navigator.clipboard.writeText(url); showError && setStatus('Link copied!'); setTimeout(setStatus, 1500, null); }
+  catch (e) { showError('Copy failed: ' + url); }
+});
+$('w-download').addEventListener('click', () => {
+  if (!currentMedia || currentMedia.isLocal) {
+    if (currentMedia?.isLocal) { window.open('/media/' + currentMedia.filename, '_blank'); return; }
+    return;
+  }
+  const audio = (currentMedia.streams || []).find(s => !s.progressive && s.acodec !== 'none' && s.vcodec === 'none')
+    || (currentMedia.streams || []).find(s => s.progressive);
+  if (!audio) { showError('No downloadable stream found.'); return; }
+  window.open('/api/proxy?url=' + encodeURIComponent(audio.url) + '&dl=1', '_blank');
+});
+
+/* ================= comments (own + YouTube videos) ================= */
+async function loadComments(cid) {
   const box = $('c-list'); box.innerHTML = '';
-  if (!list.length) { box.innerHTML = '<p class="text-xs text-gray-600 text-center py-4">No comments yet — start the conversation.</p>'; return; }
-  list.forEach(c => {
-    const el = document.createElement('div');
-    el.className = 'msg-in flex gap-3';
-    el.innerHTML = `<div class="w-8 h-8 rounded-full shrink-0 bg-gradient-to-br from-sky-400 to-fuchsia-500 grid place-items-center text-[10px] font-bold">${esc((c.author||'?')[0].toUpperCase())}</div>
-      <div class="glass rounded-xl rounded-tl-sm px-3.5 py-2.5 max-w-[85%]">
-        <p class="text-xs font-semibold text-sky-300">${esc(c.author)} <span class="text-gray-600 font-normal">· ${timeAgo(c.created_at)}</span></p>
-        <p class="text-sm text-gray-300 mt-0.5 break-words">${esc(c.body)}</p>
-      </div>`;
-    box.appendChild(el);
-  });
+  if (!cid) return;
+  try {
+    const d = await (await fetch('/api/videos/' + encodeURIComponent(cid) + '/comments')).json();
+    $('c-count').textContent = (d.comments || []).length;
+    (d.comments || []).forEach(c => {
+      const el = document.createElement('div');
+      el.className = 'msg-in flex gap-3';
+      el.innerHTML = `<div class="ch-avatar" style="width:32px;height:32px;font-size:12px;background:${avatarColor()}">${esc((c.author||'?')[0].toUpperCase())}</div>
+        <div class="min-w-0"><p class="text-xs font-medium">${esc(c.author)} <span style="color:var(--muted);font-weight:400">· ${timeAgo(c.created_at)}</span></p>
+        <p class="text-sm mt-0.5 break-words">${esc(c.body)}</p></div>`;
+      box.appendChild(el);
+    });
+  } catch (e) { $('c-count').textContent = '0'; }
 }
 $('c-form').addEventListener('submit', async e => {
   e.preventDefault();
-  if (!currentMedia || !currentMedia.isLocal) { showError('Comments are available on community uploads.'); return; }
   const body = $('c-body').value.trim(); if (!body) return;
+  const cid = currentMedia?.id;
+  if (!cid) { showError('Load a video first.'); return; }
   try {
-    const res = await fetch('/api/videos/' + currentMedia.id + '/comments', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ author: $('c-author').value.trim() || 'Guest', body })
-    });
-    if ((await res.json()).ok) { $('c-body').value = ''; loadComments(currentMedia.id); }
-  } catch (err) { showError('Could not post comment: ' + err.message); }
+    const d = await (await fetch('/api/videos/' + encodeURIComponent(cid) + '/comments', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ author: (currentUser && currentUser.name) || $('c-author').value.trim() || 'Guest', body }) })).json();
+    if (d.ok) { $('c-body').value = ''; loadComments(cid); }
+  } catch (err) { showError('Comment failed: ' + err.message); }
 });
 
 /* ================= player controls ================= */
@@ -1724,14 +1886,12 @@ video.addEventListener('loadedmetadata', () => { $('t-dur').textContent = fmtTim
 seek.addEventListener('input', () => { seeking = true; paintSeek(seek); });
 seek.addEventListener('change', () => { video.currentTime = seek.value * (video.duration || 0) / 1000; seeking = false; });
 paintSeek(seek);
-const volume = $('volume'); paintSeek(volume);
-volume.addEventListener('input', () => { video.volume = +volume.value; video.muted = false; syncMute(); paintSeek(volume); });
 $('btn-mute').addEventListener('click', () => { video.muted = !video.muted; syncMute(); });
-function syncMute() { const m = video.muted || video.volume === 0;
+function syncMute() { const m = video.muted;
   $('ic-vol').classList.toggle('hidden', m); $('ic-muted').classList.toggle('hidden', !m); }
 $('btn-pip').addEventListener('click', async () => {
   try { if (document.pictureInPictureElement) await document.exitPictureInPicture(); else await video.requestPictureInPicture(); }
-  catch (e) { showError('Picture-in-picture is not available here.'); }
+  catch (e) { showError('PiP unavailable here.'); }
 });
 $('btn-fs').addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
@@ -1744,83 +1904,38 @@ document.addEventListener('keydown', e => {
   if (e.code === 'ArrowLeft') video.currentTime = Math.max(0, video.currentTime - 5);
 });
 
-/* ================= web search / discover ================= */
-async function doSearch(q) {
-  setStatus('Searching the live web (DuckDuckGo)…');
-  try {
-    const res = await fetch('/api/search?q=' + encodeURIComponent(q));
-    const data = await res.json();
-    if (data.error && !(data.results||[]).length && !(data.news||[]).length) throw new Error(data.message || 'search failed');
-    lastSearchResults = data.results || [];
-    const items = [...(data.results||[]).map(r => ({kind:'web',...r})), ...(data.news||[]).map(r => ({kind:'news',...r}))];
-    const grid = $('discover-grid'); grid.innerHTML = '';
-    items.forEach(item => {
-      const isVideoish = /youtu\.?be|instagram|fb\.watch|facebook\.com\/.*\/videos|twitter\.com|x\.com|t\.me/i.test(item.url || '');
-      const card = document.createElement('div');
-      card.className = 'glass rounded-2xl p-4 cursor-pointer flex flex-col gap-2';
-      card.style.transition = 'all .2s ease';
-      card.onmouseenter = () => { card.style.transform = 'translateY(-3px)'; card.style.borderColor = 'rgba(14,165,233,.35)'; };
-      card.onmouseleave = () => { card.style.transform = ''; card.style.borderColor = ''; };
-      card.innerHTML = `
-        <div class="flex items-center gap-2 text-[10px] uppercase tracking-wider">
-          <span class="px-2 py-0.5 rounded-full ${item.kind==='news'?'bg-sky-500/15 text-sky-300':'bg-fuchsia-500/15 text-fuchsia-300'}">${item.kind}</span>
-          <span class="text-gray-600 truncate">${esc(item.source||'')}</span>
-        </div>
-        <h4 class="text-sm font-semibold leading-snug line-clamp-2">${esc(item.title)}</h4>
-        <p class="text-xs text-gray-500 line-clamp-3 leading-relaxed">${esc(item.body||'')}</p>
-        <div class="mt-auto pt-2 flex items-center gap-2">
-          ${isVideoish ? '<button class="play-here px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 hover:bg-fuchsia-500/30 transition">Play here</button>' : ''}
-          <a href="${esc(item.url)}" target="_blank" rel="noopener" class="ml-auto text-[11px] text-gray-500 hover:text-sky-300 underline underline-offset-2">open</a>
-        </div>`;
-      if (isVideoish) card.querySelector('.play-here').addEventListener('click', ev => { ev.stopPropagation(); openRemote(item.url); });
-      card.addEventListener('click', ev => { if (ev.target.tagName === 'A' || ev.target.closest('button')) return; window.open(item.url, '_blank', 'noopener'); });
-      grid.appendChild(card);
-    });
-    $('discover-title').textContent = 'Web results for ' + q;
-    $('discover-section').classList.remove('hidden');
-    $('discover-section').scrollIntoView({ behavior: 'smooth' });
-    setStatus(null);
-  } catch (err) { setStatus(null); showError('Search failed: ' + err.message); }
-}
-
-/* ================= reels ================= */
+/* ================= shorts ================= */
 async function loadReels() {
   const track = $('reel-track');
   try {
-    const res = await fetch('/api/videos');
-    const data = await res.json();
+    const data = await (await fetch('/api/videos')).json();
     const vids = data.videos || [];
     $('reels-empty').classList.toggle('hidden', !!vids.length);
     track.innerHTML = '';
     vids.forEach(v => track.appendChild(buildReel(v)));
     if (reelsObserver) reelsObserver.disconnect();
     reelsObserver = new IntersectionObserver(entries => {
-      entries.forEach(en => {
-        const el = en.target.querySelector('video');
-        if (en.isIntersecting) { el.play().catch(()=>{}); } else { el.pause(); }
-      });
+      entries.forEach(en => { const el = en.target.querySelector('video');
+        if (en.isIntersecting) el.play().catch(()=>{}); else el.pause(); });
     }, { root: track, threshold: 0.6 });
     track.querySelectorAll('.reel-item').forEach(el => reelsObserver.observe(el));
-  } catch (e) { showError('Could not load reels: ' + e.message); }
+  } catch (e) {}
 }
-
 function buildReel(v) {
   const item = document.createElement('div');
   item.className = 'reel-item relative w-full h-full flex items-center justify-center bg-black';
   item.innerHTML = `
     <video src="/media/${esc(v.filename)}" class="h-full max-h-full w-auto max-w-full object-contain" loop muted playsinline preload="metadata" ${v.thumb ? `poster="${esc(v.thumb)}"` : ''}></video>
     <div class="absolute inset-x-0 bottom-0 p-5 pb-6 bg-gradient-to-t from-black/85 via-black/30 to-transparent">
-      <div class="max-w-[75%]">
-        <p class="text-sm font-bold">${esc(v.title)}</p>
-        <p class="text-xs text-gray-400 mt-0.5">${esc(v.uploader)} · ${fmtViews(v.views)} views</p>
-      </div>
+      <div class="max-w-[75%]"><p class="text-sm font-bold">${esc(v.title)}</p>
+      <p class="text-xs text-gray-400 mt-0.5">${esc(v.uploader)} · ${fmtViews(v.views)} views</p></div>
     </div>
     <div class="absolute right-3 bottom-24 flex flex-col items-center gap-4">
-      <button class="reel-like w-11 h-11 rounded-full glass grid place-items-center hover:scale-110 transition" title="Like">
-        <svg class="w-5 h-5 text-pink-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 22V11l5-9a3 3 0 0 1 3 3v4h4.5a2 2 0 0 1 2 2.4l-1.6 8A2 2 0 0 1 18 22H7Z"/><path d="M7 11H4v11h3"/></svg>
+      <button class="reel-like w-11 h-11 rounded-full bg-white/10 border border-white/20 grid place-items-center hover:scale-110 transition" title="Like">
+        <svg class="w-5 h-5 text-pink-400" fill="currentColor" viewBox="0 0 24 24"><path d="M18.77 11h-4.23l1.52-4.94A1.54 1.54 0 0 0 14.6 4h-.2a1.54 1.54 0 0 0-1.34.77L8.92 12H6V4H4v16h14a2 2 0 0 0 1.95-1.55l1.66-6A2 2 0 0 0 19.6 11h-.83Z"/></svg>
       </button>
-      <button class="reel-open w-11 h-11 rounded-full glass grid place-items-center hover:scale-110 transition" title="Open & comment">
-        <svg class="w-5 h-5 text-sky-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+      <button class="reel-open w-11 h-11 rounded-full bg-white/10 border border-white/20 grid place-items-center hover:scale-110 transition" title="Open & comment">
+        <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
       </button>
     </div>`;
   const vid = item.querySelector('video');
@@ -1834,30 +1949,23 @@ function buildReel(v) {
   item.querySelector('.reel-open').addEventListener('click', () => openLocal(v.id));
   return item;
 }
-
 async function searchShorts(q) {
   if (!q.trim()) return;
-  setStatus('Searching YouTube Shorts (no API)…');
+  setStatus('Searching Shorts…');
   try {
-    const res = await fetch('/api/browse?q=' + encodeURIComponent(q + ' shorts') + '&n=32');
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    const items = (data.items || []).filter(it => (it.duration || 0) <= 300);
+    const d = await (await fetch('/api/browse?q=' + encodeURIComponent(q + ' shorts') + '&n=40')).json();
+    const items = (d.items || []).filter(it => (it.duration || 0) <= 300);
     const grid = $('shorts-grid'); grid.innerHTML = '';
-    if (!items.length) { grid.innerHTML = '<p class="col-span-full text-xs text-gray-500 text-center py-4">No shorts found — try another keyword.</p>'; setStatus(null); return; }
+    if (!items.length) { grid.innerHTML = '<p class="col-span-full text-sm py-4" style="color:var(--muted)">No shorts found.</p>'; setStatus(null); return; }
     items.forEach(it => {
       const c = document.createElement('div');
-      c.className = 'poster relative rounded-xl overflow-hidden cursor-pointer bg-white/5 border border-white/10 aspect-[9/16]';
+      c.className = 'yt-card relative rounded-xl overflow-hidden cursor-pointer bg-black';
       c.innerHTML = `
-        ${it.thumbnail ? `<img src="${esc(it.thumbnail)}" class="w-full h-full object-cover" loading="lazy">` : '<div class="w-full h-full bg-gradient-to-br from-fuchsia-500/20 to-sky-500/20"></div>'}
-        <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-black/80 text-[10px] font-semibold tabular-nums">${esc(it.duration_label || '')}</span>
-        <div class="ph-over absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent flex flex-col justify-end p-2">
-          <span class="w-8 h-8 rounded-full bg-fuchsia-500 text-white grid place-items-center mb-1.5 mx-auto shadow-lg">
-            <svg class="w-4 h-4 ml-0.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l11.1-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z"/></svg>
-          </span>
-          <p class="text-[10px] font-bold leading-tight line-clamp-2 text-center">${esc(it.title)}</p>
-        </div>`;
-      c.addEventListener('click', () => openRemote(it.url));
+        ${it.thumbnail ? `<img src="${esc(it.thumbnail)}" class="w-full aspect-[9/16] object-cover" loading="lazy">` : '<div class="w-full aspect-[9/16]"></div>'}
+        <span class="dur-badge">${esc(it.duration_label || '')}</span>
+        <div class="absolute inset-x-0 bottom-0 p-2 bg-gradient-to-t from-black/90 to-transparent">
+          <p class="text-[11px] font-bold leading-tight line-clamp-2">${esc(it.title)}</p></div>`;
+      c.addEventListener('click', () => openRemote(it.url, it));
       grid.appendChild(c);
     });
     setStatus(null);
@@ -1865,36 +1973,100 @@ async function searchShorts(q) {
 }
 $('shorts-btn').addEventListener('click', () => searchShorts($('shorts-search').value));
 $('shorts-search').addEventListener('keydown', e => { if (e.key === 'Enter') searchShorts($('shorts-search').value); });
-
 $('reel-url-input').addEventListener('change', async () => {
-  const url = $('reel-url-input').value.trim();
-  if (!isUrl(url)) return;
-  setStatus('Adding reel from link…');
+  const url = $('reel-url-input').value.trim(); if (!isUrl(url)) return;
+  setStatus('Adding reel…');
   try {
-    const res = await fetch('/api/stream?url=' + encodeURIComponent(url));
-    const data = await res.json();
+    const data = await (await fetch('/api/stream?url=' + encodeURIComponent(url))).json();
     if (data.error) throw new Error(data.message);
     const best = (data.streams || []).find(s => s.progressive) || data.best;
-    if (!best) throw new Error('no playable stream');
-    const track = $('reel-track');
     const item = document.createElement('div');
     item.className = 'reel-item relative w-full h-full flex items-center justify-center bg-black';
     item.innerHTML = `
       <video src="/api/proxy?url=${encodeURIComponent(best.url)}" class="h-full w-auto max-w-full object-contain" loop muted playsinline autoplay controls></video>
-      <div class="absolute inset-x-0 bottom-0 p-5 pb-6 bg-gradient-to-t from-black/85 via-black/30 to-transparent pointer-events-none">
+      <div class="absolute inset-x-0 bottom-0 p-5 pb-6 bg-gradient-to-t from-black/85 to-transparent pointer-events-none">
         <p class="text-sm font-bold">${esc(data.title)}</p>
-        <p class="text-xs text-gray-400 mt-0.5">${esc(data.extractor)} · ${esc(data.uploader)}</p>
-      </div>`;
-    track.prepend(item);
-    $('reel-url-input').value = '';
-    $('reels-empty').classList.add('hidden');
-    setStatus(null);
+        <p class="text-xs text-gray-400 mt-0.5">${esc(data.extractor)} · ${esc(data.uploader)}</p></div>`;
+    $('reel-track').prepend(item); $('reel-url-input').value = '';
+    $('reels-empty').classList.add('hidden'); setStatus(null);
   } catch (e) { setStatus(null); showError('Reel add failed: ' + e.message); }
 });
 
+/* ================= platform views ================= */
+const PLATFORMS = {
+  youtube:    { name: 'YouTube',   icon: '<path fill="#ff0000" d="M23 12s0-3.85-.5-5.7a2.9 2.9 0 0 0-2-2C18.6 3.8 12 3.8 12 3.8s-6.6 0-8.5.5a2.9 2.9 0 0 0-2 2C1 8.15 1 12 1 12s0 3.85.5 5.7a2.9 2.9 0 0 0 2 2c1.9.5 8.5.5 8.5.5s6.6 0 8.5-.5a2.9 2.9 0 0 0 2-2c.5-1.85.5-5.7.5-5.7ZM9.75 15.5v-7L15.5 12l-5.75 3.5Z"/>', sub: 'Trending, search & ad-free playback via YouTube Data API + yt-dlp', search: 'trending music video' },
+  instagram:  { name: 'Instagram', icon: '<path fill="#e1306c" d="M12 2.16c3.2 0 3.58.01 4.85.07 1.17.05 1.96.24 2.42.4.6.24 1.04.52 1.5.98.46.46.74.9.98 1.5.16.46.35 1.25.4 2.42.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.05 1.17-.24 1.96-.4 2.42a4 4 0 0 1-.98 1.5c-.46.46-.9.74-1.5.98-.46.16-1.25.35-2.42.4-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-1.17-.05-1.96-.24-2.42-.4a4 4 0 0 1-1.5-.98 4 4 0 0 1-.98-1.5c-.16-.46-.35-1.25-.4-2.42-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85c.05-1.17.24-1.96.4-2.42.24-.6.52-1.04.98-1.5.46-.46.9-.74 1.5-.98.46-.16 1.25-.35 2.42-.4C8.42 2.17 8.8 2.16 12 2.16Zm0 5.68a4.16 4.16 0 1 0 0 8.32 4.16 4.16 0 0 0 0-8.32Zm0 6.86a2.7 2.7 0 1 1 0-5.4 2.7 2.7 0 0 1 0 5.4Z"/>', sub: 'Public Reels — paste link ya web results se play karo', search: 'instagram reels trending' },
+  facebook:   { name: 'Facebook',  icon: '<path fill="#1877f2" d="M22 12a10 10 0 1 0-11.56 9.88v-6.99H7.9V12h2.54V9.8c0-2.5 1.5-3.89 3.78-3.89 1.09 0 2.24.2 2.24.2v2.46H15.2c-1.24 0-1.63.77-1.63 1.56V12h2.78l-.44 2.89h-2.34v6.99A10 10 0 0 0 22 12Z"/>', sub: 'Public videos & Reels', search: 'facebook reels trending' },
+  x:          { name: 'X (Twitter)', icon: '<path fill="currentColor" d="M18.9 2H22l-6.77 7.74L23.2 22h-6.24l-4.9-6.4L6.5 22H3.34l7.24-8.28L2.8 2h6.4l4.43 5.85L18.9 2Z"/>', sub: 'Public videos from X', search: 'twitter viral video' },
+  telegram:   { name: 'Telegram', icon: '<path fill="#26a5e4" d="M21.9 4.6 18.9 19c-.23 1-.8 1.25-1.63.78l-4.5-3.32-2.17 2.09c-.24.24-.44.44-.9.44l.33-4.6 8.37-7.56c.36-.32-.08-.5-.57-.18L7.66 13.53l-4.44-1.39c-.96-.3-.98-.96.2-1.42l17.3-6.67c.8-.3 1.5.18 1.18 1.55Z"/>', sub: 'Public channel videos (t.me links)', search: 'telegram video channel' },
+  whatsapp:   { name: 'WhatsApp',  icon: '<path fill="#25d366" d="M12 2a10 10 0 0 0-8.66 15L2 22l5.13-1.34A10 10 0 1 0 12 2Zm5.06 14.06c-.21.6-1.23 1.14-1.7 1.19-.44.05-.98.07-1.57-.11a14 14 0 0 1-5.87-4.05c-1.6-1.85-2.3-3.7-2.3-4.47 0-.77.55-1.63 1.02-2 .3-.24.6-.28.8-.28h.58c.19 0 .44-.03.68.5l.93 2.23c.08.16.13.35.02.56l-.35.53-.5.56c-.16.16-.33.34-.15.66.18.32.8 1.34 1.72 2.18 1.19 1.08 2.2 1.41 2.5 1.57.3.16.48.13.66-.08l.95-1.1c.21-.27.4-.2.66-.1l2.1.99c.26.13.44.19.5.3.07.11.07.64-.13 1.24Z"/>', sub: 'Statuses E2E-encrypted hain — extract nahi ho sakti', search: 'whatsapp status video', note: 'WhatsApp statuses aur chats end-to-end encrypted hain, isliye koi bhi open extractor unhe access nahi kar sakta. YouTube / Instagram / X / Facebook / Telegram ke public links use karo.' },
+};
+document.querySelectorAll('.sb-item[data-platform]').forEach(it =>
+  it.addEventListener('click', () => openPlatform(it.dataset.platform)));
+
+async function openPlatform(key) {
+  const p = PLATFORMS[key]; if (!p) return;
+  showView('platform');
+  document.querySelectorAll('.sb-item').forEach(x => x.classList.remove('active'));
+  const act = document.querySelector(`.sb-item[data-platform="${key}"]`);
+  if (act) act.classList.add('active');
+  $('pf-name').textContent = p.name;
+  $('pf-sub').textContent = p.sub;
+  $('pf-icon').innerHTML = `<svg viewBox="0 0 24 24" style="width:26px;height:26px">${p.icon}</svg>`;
+  const note = $('pf-note');
+  if (p.note) { note.textContent = p.note; note.classList.remove('hidden'); } else note.classList.add('hidden');
+  const grid = $('pf-grid'); grid.innerHTML = '';
+  $('pf-url').value = '';
+  try {
+    const d = await (await fetch('/api/search?q=' + encodeURIComponent(p.search))).json();
+    (d.results || []).slice(0, 12).forEach(r => {
+      const isVideoish = /youtu\.?be|instagram|fb\.watch|facebook\.com|twitter\.com|x\.com|t\.me/i.test(r.url || '');
+      const card = document.createElement('div');
+      card.className = 'yt-card rounded-xl p-4';
+      card.style.background = 'var(--bg2)';
+      card.innerHTML = `
+        <p class="v-meta text-[10px] uppercase tracking-wider mb-1.5">${esc(r.source || '')}</p>
+        <p class="v-title">${esc(r.title)}</p>
+        <p class="v-meta line-clamp-3 mt-1">${esc(r.body || '')}</p>
+        ${isVideoish ? '<button class="play-here mt-2 px-3 py-1.5 rounded-full text-[11px] font-semibold" style="background:var(--accent);color:#fff">Play here</button>'
+                     : '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="inline-block mt-2 text-[11px] underline">open</a>'}`;
+      if (isVideoish) card.querySelector('.play-here').addEventListener('click', ev => { ev.stopPropagation(); openRemote(r.url, null); });
+      grid.appendChild(card);
+    });
+  } catch (e) {}
+}
+$('pf-play').addEventListener('click', () => { const u = $('pf-url').value.trim(); if (u) openRemote(u, null); });
+$('pf-url').addEventListener('keydown', e => { if (e.key === 'Enter') $('pf-play').click(); });
+
+/* ================= explore ================= */
+document.querySelectorAll('.sb-item[data-explore]').forEach(it =>
+  it.addEventListener('click', () => {
+    showView('home');
+    document.querySelectorAll('#home-chips .chip-btn').forEach(x => x.classList.remove('on'));
+    loadFeed(it.dataset.explore === 'trending' ? 'trending' : it.dataset.explore);
+    document.querySelector(`#home-chips .chip-btn[data-feed="${it.dataset.explore}"]`)?.classList.add('on');
+  }));
+
+/* ================= liked / mine ================= */
+function loadLiked() {
+  const grid = $('liked-grid'); grid.innerHTML = '';
+  const liked = lsGet('nt-liked', []);
+  $('liked-empty').classList.toggle('hidden', !!liked.length);
+  liked.forEach(v => grid.appendChild(ytCard({ ...v, kind: 'youtube' })));
+}
+async function loadMine() {
+  const grid = $('mine-grid'); grid.innerHTML = '';
+  try {
+    const d = await (await fetch('/api/videos')).json();
+    $('mine-empty').classList.toggle('hidden', !!(d.videos || []).length);
+    (d.videos || []).forEach(v => grid.appendChild(ytCard({ ...v, kind: 'local', url: '' })));
+  } catch (e) {}
+}
+$('mine-upload-btn').addEventListener('click', () => $('upload-modal').classList.remove('hidden'));
+
 /* ================= upload ================= */
-const openModal = () => { $('upload-modal').classList.remove('hidden'); };
-const closeModal = () => { $('upload-modal').classList.add('hidden'); };
+const openModal = () => $('upload-modal').classList.remove('hidden');
+const closeModal = () => $('upload-modal').classList.add('hidden');
 $('btn-upload').addEventListener('click', openModal);
 $('upload-close').addEventListener('click', closeModal);
 $('upload-modal').addEventListener('click', e => { if (e.target === $('upload-modal')) closeModal(); });
@@ -1904,16 +2076,14 @@ dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dra
 dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
 dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]); });
 $('file-input').addEventListener('change', e => { if (e.target.files[0]) pickFile(e.target.files[0]); });
-
 function pickFile(f) {
-  if (!f.type.startsWith('video/')) { showError('Please choose a video file.'); return; }
-  if (f.size > 200 * 1024 * 1024) { showError('File is over the 200 MB limit.'); return; }
+  if (!f.type.startsWith('video/')) { showError('Video file choose karo.'); return; }
+  if (f.size > 200 * 1024 * 1024) { showError('200 MB se zyada hai.'); return; }
   uploadCtx = { file: f, thumb: '', duration: 0 };
   $('drop-title').textContent = f.name + ' (' + (f.size/1048576).toFixed(1) + ' MB)';
   $('up-submit').disabled = false;
   const tv = $('thumb-video');
-  tv.src = URL.createObjectURL(f);
-  tv.muted = true;
+  tv.src = URL.createObjectURL(f); tv.muted = true;
   tv.onloadeddata = () => { try { tv.currentTime = Math.min(1, tv.duration / 3); } catch (e) {} };
   tv.onseeked = () => {
     try {
@@ -1926,7 +2096,6 @@ function pickFile(f) {
     uploadCtx.duration = tv.duration || 0;
   };
 }
-
 $('up-submit').addEventListener('click', () => {
   if (!uploadCtx.file) return;
   const fd = new FormData();
@@ -1940,10 +2109,8 @@ $('up-submit').addEventListener('click', () => {
   $('up-progress').classList.remove('hidden'); $('up-bar').style.width = '0%'; $('up-pct').textContent = '0%';
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/upload');
-  xhr.upload.onprogress = e => {
-    if (e.lengthComputable) { const p = Math.round(e.loaded / e.total * 100);
-      $('up-bar').style.width = p + '%'; $('up-pct').textContent = p + '%'; }
-  };
+  xhr.upload.onprogress = e => { if (e.lengthComputable) { const p = Math.round(e.loaded / e.total * 100);
+    $('up-bar').style.width = p + '%'; $('up-pct').textContent = p + '%'; } };
   xhr.onload = () => {
     btn.disabled = false; btn.textContent = 'Upload';
     try {
@@ -1953,32 +2120,33 @@ $('up-submit').addEventListener('click', () => {
       $('up-title').value = ''; $('up-desc').value = '';
       if (!currentUser) $('up-uploader').value = '';
       $('thumb-preview').classList.add('hidden');
-      $('drop-title').textContent = 'Drop your video here or click to browse';
+      $('drop-title').textContent = 'Drag & drop or click to select';
       uploadCtx = { file: null, thumb: '', duration: 0 }; $('up-submit').disabled = true;
-      loadHome();
       openLocal(d.video.id);
     } catch (e) { showError('Upload response error.'); }
   };
-  xhr.onerror = () => { btn.disabled = false; btn.textContent = 'Upload'; showError('Upload failed — network error.'); };
+  xhr.onerror = () => { btn.disabled = false; btn.textContent = 'Upload'; showError('Network error.'); };
   xhr.send(fd);
 });
 
-/* ================= co-pilot chat ================= */
+/* ================= co-pilot ================= */
+function openCopilot() { $('copilot-panel').classList.remove('hidden'); }
+$('btn-copilot').addEventListener('click', openCopilot);
+$('copilot-close').addEventListener('click', () => $('copilot-panel').classList.add('hidden'));
 function appendMsg(role, text, sources) {
   const log = $('chat-log');
   const wrap = document.createElement('div');
-  wrap.className = 'msg-in flex gap-3' + (role === 'user' ? ' flex-row-reverse' : '');
+  wrap.className = 'msg-in flex gap-2.5' + (role === 'user' ? ' flex-row-reverse' : '');
   const body = text.split('\n').map(l => esc(l)).join('<br>');
   const srcHtml = (sources && sources.length)
-    ? '<div class="mt-2 pt-2 border-t border-white/10 space-y-1">' + sources.map(s =>
-        `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="block text-[11px] text-sky-400/80 hover:text-sky-300 truncate">${esc(s.title || s.url)}</a>`).join('') + '</div>'
+    ? '<div class="mt-2 pt-2 space-y-1" style="border-color:var(--line);border-top:1px solid">' + sources.map(s =>
+        `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="block text-[11px] truncate">${esc(s.title || s.url)}</a>`).join('') + '</div>'
     : '';
   wrap.innerHTML = role === 'user'
-    ? `<div class="rounded-2xl rounded-tr-sm px-4 py-3 text-sm bg-sky-400/20 border border-sky-400/30 max-w-[85%] leading-relaxed">${body}</div>`
-    : `<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-400 to-fuchsia-500 shrink-0 grid place-items-center text-[10px] font-bold">AI</div>
-       <div class="glass rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-gray-200 leading-relaxed max-w-[85%]">${body}${srcHtml}</div>`;
-  log.appendChild(wrap);
-  log.scrollTop = log.scrollHeight;
+    ? `<div class="rounded-2xl rounded-tr-sm px-3.5 py-2.5 max-w-[85%]" style="background:var(--accent);color:#fff">${body}</div>`
+    : `<div class="ch-avatar" style="width:28px;height:28px;font-size:11px;background:linear-gradient(135deg,#3ea6ff,#ff0033)">AI</div>
+       <div class="rounded-2xl rounded-tl-sm px-3.5 py-2.5 max-w-[85%]" style="background:var(--bg2)">${body}${srcHtml}</div>`;
+  log.appendChild(wrap); log.scrollTop = log.scrollHeight;
   return wrap;
 }
 async function sendChat(q) {
@@ -1986,40 +2154,29 @@ async function sendChat(q) {
   appendMsg('user', q);
   const holder = appendMsg('ai', '…');
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const data = await (await fetch('/api/chat', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         query: q,
-        video: currentMedia ? {
-          title: currentMedia.title, uploader: currentMedia.uploader,
+        video: currentMedia ? { title: currentMedia.title, uploader: currentMedia.uploader,
           description: currentMedia.description || '', duration_label: currentMedia.duration_label,
-          webpage_url: currentMedia.webpage_url
-        } : null,
-        search_results: lastSearchResults.slice(0, 6).map(r => ({ title: r.title, url: r.url, body: r.body }))
-      })
-    });
-    const data = await res.json();
+          webpage_url: currentMedia.webpage_url } : null,
+        search_results: []
+      }) })).json();
     holder.remove();
     appendMsg('ai', data.answer || '…', data.sources);
-  } catch (err) { holder.remove(); appendMsg('ai', 'Co-pilot error: ' + err.message); }
+  } catch (err) { holder.remove(); appendMsg('ai', 'Error: ' + err.message); }
 }
 $('chat-form').addEventListener('submit', e => { e.preventDefault(); const v = $('chat-input').value; $('chat-input').value = ''; sendChat(v); });
 document.querySelectorAll('.chat-chip').forEach(c => c.addEventListener('click', () => {
   let q = c.textContent.trim();
-  if (q === 'Find related videos' && currentMedia) q = 'search ' + currentMedia.title + ' video';
+  if (q.includes('related') && currentMedia) q = 'search ' + currentMedia.title + ' video';
   sendChat(q);
 }));
-$('chat-toggle').addEventListener('click', () => {
-  const p = $('chat-panel');
-  if (getComputedStyle(p).display === 'none') { p.classList.remove('hidden'); }
-  else { p.classList.add('hidden'); }
-  showView('watch');
-});
-$('chat-close').addEventListener('click', () => $('chat-panel').classList.add('hidden'));
 
 /* ================= boot ================= */
 refreshUser();
-loadHome();
+loadFeed('trending');
 </script>
 </body>
 </html>
@@ -2033,7 +2190,7 @@ async def index():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "4.0.0"}
+    return {"status": "ok", "version": "5.0.0"}
 
 
 # --------------------------------------------------------------------------- #
